@@ -1,4 +1,6 @@
+mod access_logs;
 mod app_info;
+mod audit;
 mod frp_profiles;
 mod health;
 mod logs;
@@ -11,6 +13,11 @@ pub(crate) mod window_chrome;
 mod workspace;
 
 pub use app_info::{check_app_update, open_url};
+pub use access_logs::{open_http_access_log_directory, query_http_access_logs};
+pub use audit::{
+    clear_all_logs, get_audit_config, get_audit_record, get_audit_stats, query_audit_records,
+    set_audit_config,
+};
 pub use ui_memory::{get_webview_memory_sample, recreate_ui_webview};
 pub use window_chrome::{hide_to_tray, quit_app, show_main_window};
 pub use frp_profiles::{

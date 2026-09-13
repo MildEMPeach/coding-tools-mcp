@@ -2,15 +2,37 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::audit::AuditRequestContext;
 use crate::tools::{
-    call_tool, list_tools_for_profile, wrap_mcp_tool_result, SharedToolContext, ToolContext,
-    Workspace,
+    call_tool_with_audit, list_tools_for_profile, wrap_mcp_tool_result, SharedToolContext,
+    record_tool_rejection_with_audit, ToolContext, Workspace,
 };
 use crate::workspace::AuthConfig;
 
 pub type SharedState = SharedToolContext;
 
+// 生产入口接收监听层采集的 headers 上下文；原 handle_request 仅为无 HTTP 环境的测试生成
+// 最小上下文。协议分发保持与 Axum 解耦，且只让 tools/call 进入工具审计。
+#[cfg(test)]
 pub fn handle_request(state: &SharedState, body: &Value) -> Value {
+    let request = AuditRequestContext {
+        transport: "mcp".into(),
+        method: body
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        request_id: body.get("id").and_then(crate::audit::request_id_from_value),
+        route: Some("/mcp".into()),
+        ..AuditRequestContext::default()
+    };
+    handle_request_with_context(state, body, &request)
+}
+
+pub fn handle_request_with_context(
+    state: &SharedState,
+    body: &Value,
+    request: &AuditRequestContext,
+) -> Value {
     let method = body.get("method").and_then(Value::as_str).unwrap_or("");
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let params = body.get("params").cloned().unwrap_or(Value::Null);
@@ -26,7 +48,7 @@ pub fn handle_request(state: &SharedState, body: &Value) -> Value {
             let tools = list_tools_for_profile(&state.tool_profile);
             Ok(serde_json::json!({ "tools": tools }))
         }
-        "tools/call" => handle_tools_call(state, &params),
+        "tools/call" => handle_tools_call(state, &params, request),
         _ => Err(serde_json::json!({
             "code": -32601,
             "message": format!("Method not found: {method}")
@@ -55,7 +77,11 @@ fn initialize_result() -> Value {
     })
 }
 
-fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value> {
+fn handle_tools_call(
+    state: &SharedState,
+    params: &Value,
+    request: &AuditRequestContext,
+) -> Result<Value, Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -64,15 +90,26 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
 
     let canonical_name = crate::tools::registry::canonical_tool_name(name);
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
+    // 未知/未暴露工具在 dispatcher 前提前返回，拒绝记录必须放在这里；通过校验的路径改用
+    // audited wrapper，审计成功与否都不改变原 MCP 结果。
     if !known.iter().any(|n| n == &canonical_name) {
+        let message = format!("Unknown tool: {name}");
+        record_tool_rejection_with_audit(
+            state.as_ref(),
+            request,
+            name,
+            &args,
+            "UNKNOWN_TOOL",
+            &message,
+        );
         return Err(serde_json::json!({
             "code": -32602,
-            "message": format!("Unknown tool: {name}"),
+            "message": message,
             "data": { "reason": "unknown_tool" }
         }));
     }
 
-    let structured = call_tool(state.as_ref(), canonical_name, &args);
+    let structured = call_tool_with_audit(state.as_ref(), canonical_name, &args, request);
     Ok(wrap_mcp_tool_result(canonical_name, &args, structured))
 }
 
@@ -98,8 +135,11 @@ fn tool_arguments(name: &str, params: &Value) -> Value {
     args
 }
 
+// 审计在 SharedState 创建时绑定：此处同时拥有正式 workspace_id，且尚未被多请求共享；
+// 测试构造路径不调用 with_audit，因此不会写入用户数据库。
 pub fn new_state(
     workspace: Workspace,
+    workspace_id: String,
     auth: AuthConfig,
     policy: crate::tools::policy::PolicySettings,
     tool_profile: String,
@@ -111,7 +151,8 @@ pub fn new_state(
         policy,
         tool_profile,
         permission_mode,
-    ))
+    )
+    .with_audit(workspace_id))
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
   import { getWebviewMemorySample } from "$lib/api/ui-memory";
   import { reloadUiOnly } from "$lib/ui-memory-guard";
   import { showToast } from "$lib/stores/toast";
+  import AuditSettingsCard from "$lib/components/AuditSettingsCard.svelte";
 
   let proxy = $state<ProxyConfigDto>({ mode: "none", url: "" });
   let changed = $state(false);
@@ -179,6 +180,8 @@
         </button>
       </div>
     </div>
+
+    <AuditSettingsCard />
 
     <div class="tx-card p-4">
       <h3 class="text-sm font-semibold">网络代理</h3>

@@ -85,6 +85,10 @@
     goto("/settings/keys");
   }
 
+  function openAuditSettings() {
+    goto("/settings/audit");
+  }
+
   onMount(() => {
     const stopGuard = startUiMemoryGuard();
     const stopClose = startCloseGuard(() => {
@@ -124,6 +128,13 @@
       onclick={openKeysSettings}
     >
       共享密钥
+    </button>
+    <button
+      type="button"
+      class="tx-settings-link {$page.url.pathname === '/settings/audit' ? 'active' : ''}"
+      onclick={openAuditSettings}
+    >
+      运行日志
     </button>
     <button
       type="button"

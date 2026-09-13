@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use axum::extract::{Form, Query, State};
 use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -15,7 +16,8 @@ use crate::auth::{
     protected_resource_metadata, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
     AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
 };
-use crate::mcp::server::{handle_request, new_state, SharedState};
+use crate::audit::request_context_from_headers;
+use crate::mcp::server::{handle_request_with_context, new_state, SharedState};
 use crate::secret::SecretStore;
 use crate::tools::Workspace;
 use crate::tunnel::append_profile_log;
@@ -52,8 +54,11 @@ pub fn spawn_listener(
     let workspace_display = workspace_path.display().to_string();
     let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
     let policy = PolicySettings::from_runtime(&runtime);
+    // 监听器创建 SharedState 时注入稳定 workspace_id；服务端后续只持有共享 Context，无法再从
+    // 单条 JSON-RPC 请求可靠恢复工作区归属。
     let mcp = new_state(
         workspace,
+        workspace_id.clone(),
         auth.clone(),
         policy,
         runtime.tool_profile.clone(),
@@ -126,6 +131,10 @@ async fn serve(
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let profile_id = state.workspace_id.clone();
+    // access 中间件包在完整 MCP Router 外层，统一记录协议、OAuth、discovery 与 404；"mcp"
+    // 分区避免和同工作区 Actions 日志混写。
+    let access_log_state =
+        crate::access_log::AccessLogState::new(profile_id.clone(), "mcp", state.mcp.audit_store());
     let app = Router::new()
         .route("/mcp", get(mcp_discovery).post(mcp_post))
         .route(
@@ -139,7 +148,11 @@ async fn serve(
         .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
         .route("/oauth/token", post(oauth_token_post))
         .with_state(state)
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(
+            access_log_state,
+            crate::access_log::middleware,
+        ));
 
     append_profile_log(
         &profile_id,
@@ -201,6 +214,15 @@ async fn mcp_post(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // 在 body 移入 blocking 执行前提取 headers 与 JSON-RPC id，使服务端审计获得完整请求上下文；
+    // id 只做协议关联，记录唯一性仍由审计 UUID 保证。
+    let request_context = request_context_from_headers(
+        &headers,
+        "mcp",
+        Some(method.clone()),
+        body.get("id").and_then(crate::audit::request_id_from_value),
+        Some("/mcp".into()),
+    );
     append_profile_log(
         &state.workspace_id,
         "mcp-requests.log",
@@ -212,7 +234,10 @@ async fn mcp_post(
 
     let mcp = state.mcp.clone();
     let profile_id = state.workspace_id.clone();
-    let result = tokio::task::spawn_blocking(move || handle_request(&mcp, &body)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        handle_request_with_context(&mcp, &body, &request_context)
+    })
+    .await;
     match result {
         Ok(response) => {
             append_profile_log(

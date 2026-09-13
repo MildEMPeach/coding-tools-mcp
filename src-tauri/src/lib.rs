@@ -1,8 +1,10 @@
 #![cfg_attr(target_os = "windows", allow(linker_messages))]
 
 mod actions;
+mod access_log;
 mod app_state;
 mod auth;
+mod audit;
 mod commands;
 mod data;
 mod error;
@@ -20,14 +22,17 @@ mod workspace;
 
 use app_state::AppState;
 use commands::{
-    check_app_update, create_workspace, delete_frp_profile, delete_workspace,
+    check_app_update, clear_all_logs, create_workspace, delete_frp_profile, delete_workspace,
+    get_audit_config, get_audit_record, get_audit_stats, query_audit_records,
     get_actions_runtime_status, get_app_settings, get_download_config, get_frp_snippet,
     get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret, get_webview_memory_sample,
     get_workspace_secret, hide_to_tray, install_software, list_frp_profiles, list_software,
     list_workspaces, open_url, open_workspace_directory, quit_app, read_workspace_logs,
-    recreate_ui_webview, regenerate_shared_secret, regenerate_workspace_secret,
+    open_http_access_log_directory, query_http_access_logs, recreate_ui_webview,
+    regenerate_shared_secret, regenerate_workspace_secret,
     restart_actions_runtime, restart_runtime, restart_tunnel, run_health_checks, save_frp_profile,
-    set_download_config, set_last_workspace, set_proxy, set_shared_secret, set_workspace_secret,
+    set_audit_config, set_download_config, set_last_workspace, set_proxy, set_shared_secret,
+    set_workspace_secret,
     show_main_window, start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime,
     stop_runtime, stop_tunnel, test_tunnel, uninstall_software, update_workspace,
 };
@@ -175,6 +180,14 @@ pub fn run() {
             open_workspace_directory,
             open_url,
             check_app_update,
+            get_audit_config,
+            set_audit_config,
+            clear_all_logs,
+            query_audit_records,
+            get_audit_record,
+            get_audit_stats,
+            query_http_access_logs,
+            open_http_access_log_directory,
             delete_workspace,
             start_runtime,
             stop_runtime,

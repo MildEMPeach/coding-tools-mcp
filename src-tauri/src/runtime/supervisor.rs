@@ -91,6 +91,10 @@ impl RuntimeSupervisor {
         self.refresh(profile, ServiceKind::Actions);
     }
 
+    /// 上游原有的同步工作区停止入口。
+    ///
+    /// 删除工作区现改用异步 begin_stop、等待在途请求与日志落盘、再 finish_stop；保留此
+    /// 方法供维护者决定后续兼容策略，因此当前 Audit 流程不再调用它。
     pub fn drop_workspace(&mut self, profile: &WorkspaceProfile) {
         self.sync_stop_and_wait(profile, ServiceKind::Mcp);
         self.sync_stop_and_wait(profile, ServiceKind::Actions);
