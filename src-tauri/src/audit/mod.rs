@@ -1,5 +1,25 @@
-//! 工具调用审计的 SQLite 存储层：统一 MCP/Actions 的结果分类、详情裁剪、查询与保留期清理。
-//! 列表默认读取摘要；命令、输入和输出仅在按审计 UUID 展开记录时读取。
+//! MCP/Actions 共用的调用审计：SQLite 存储、详情裁剪、查询与保留期清理。
+//! 列表读取摘要，展开记录时按 UUID 加载命令与输入/输出。
+//!
+//! ## 分类口径
+//!
+//! 统计“调用是否正常完成”，不表示“被检查的代码已通过检查”。
+//!
+//! | 结果 | 审计状态 |
+//! | --- | --- |
+//! | 正常搜索，包括无匹配 | success |
+//! | 检查完成，发现代码或格式问题 | success（规则待实现） |
+//! | 启动、参数/配置、文件权限错误，崩溃或超时 | failure |
+//! | 安全/权限策略拒绝 | rejected |
+//!
+//! 退出码按程序与选项解释，不能仅凭收到响应或非零退出判定成败。
+//! 例如默认 ruff check：1 表示发现问题，2 表示检查器异常。
+//!
+//! 当前仅接入 grep 无匹配修正，具体边界见 grep_outcome。
+//! 保留原始 exit_code、command_ok 与 stdout/stderr；running 仅表示已受理。
+//! 本次不新增状态或 UI 标签，不重算历史记录。
+
+mod grep_outcome;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -50,6 +70,8 @@ pub struct AuditStore {
     connection: Arc<Mutex<Connection>>,
     config: Arc<RwLock<AuditConfig>>,
     last_cleanup_day: Arc<AtomicI64>,
+    // 仅审计分类共享的有界会话类型缓存，不保存命令正文。
+    grep_sessions: Arc<Mutex<grep_outcome::GrepSessions>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +295,7 @@ impl AuditStore {
             connection: Arc::new(Mutex::new(connection)),
             config: Arc::new(RwLock::new(config.clone())),
             last_cleanup_day: Arc::new(AtomicI64::new(-1)),
+            grep_sessions: Arc::new(Mutex::new(grep_outcome::GrepSessions::default())),
         };
         if let Err(error) =
             store.cleanup_expired_records(config.tool_audit_retention_days, current_time_ms(), true)
@@ -339,7 +362,9 @@ impl AuditStore {
         self.cleanup_expired_records(config.tool_audit_retention_days, finished_at_ms, false)?;
         // MCP 与 Actions 共用同一捕获和结果分类链路，防止两个入口产生不同统计口径。
         let details = capture_pair(args, output, config.detail_limit_bytes)?;
-        let response = response_metadata(tool_name, output);
+        let response = grep_outcome::classify(
+            &self.grep_sessions, workspace_id, &request.transport, tool_name, args, output,
+        );
         // command 是输入参数的派生展示；输入正文未保存或已截断时不得单独保留完整命令。
         let command = details
             .0
@@ -730,11 +755,8 @@ struct ResponseMetadata {
     termination_reason: Option<String>,
 }
 
-/// 从工具输出推导审计三态及错误元数据。
-///
-/// `ok`、`transport_ok` 或实际命令失败会标记错误；成功完成的 kill_session 是管理操作，
-/// 即使被终止进程的 command_ok=false 也属于调用成功。policy、permission、security 归为
-/// rejected，其余错误归为 failure。
+/// 基础三态：工具、传输或命令失败按错误类别记为 failure/rejected。
+/// 已完成的 kill_session 保持成功；grep 无匹配例外由 grep_outcome 修正。
 fn response_metadata(tool_name: &str, output: &Value) -> ResponseMetadata {
     let successful_session_kill = tool_name == "kill_session"
         && matches!(

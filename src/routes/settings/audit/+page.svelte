@@ -955,17 +955,20 @@
                         <span class="text-[11px] text-[var(--color-text-muted)]">来源 IP</span>
                         <span class="font-mono font-medium text-[var(--color-text)]">{detail.forwardedIp ?? "无"}</span>
                       </div>
-                      <div class="flex flex-col gap-0.5 md:col-span-2">
-                        <span class="text-[11px] text-[var(--color-text-muted)]">耗时</span>
-                        <span class="font-mono font-medium text-[var(--color-text)]">{detail.durationMs} ms</span>
-                      </div>
-                      <div class="flex flex-col gap-0.5">
-                        <span class="text-[11px] text-[var(--color-text-muted)]">输入大小</span>
-                        <span class="font-mono font-medium text-[var(--color-text)]">{formatBytes(detail.inputBytes)}{detail.inputTruncated ? " (已截断)" : ""}</span>
-                      </div>
-                      <div class="flex flex-col gap-0.5">
-                        <span class="text-[11px] text-[var(--color-text-muted)]">输出大小</span>
-                        <span class="font-mono font-medium text-[var(--color-text)]">{formatBytes(detail.outputBytes)}{detail.outputTruncated ? " (已截断)" : ""}</span>
+                      <!-- 指标沿用上方网格列宽，依次占前三格，与身份信息上下对齐。 -->
+                      <div class="col-span-full grid grid-cols-2 gap-x-5 gap-y-3 sm:grid-cols-3 md:grid-cols-4">
+                        <div class="flex flex-col gap-0.5">
+                          <span class="text-[11px] text-[var(--color-text-muted)]">输入大小</span>
+                          <span class="font-mono font-medium text-[var(--color-text)]">{formatBytes(detail.inputBytes)}{detail.inputTruncated ? " (已截断)" : ""}</span>
+                        </div>
+                        <div class="flex flex-col gap-0.5">
+                          <span class="text-[11px] text-[var(--color-text-muted)]">输出大小</span>
+                          <span class="font-mono font-medium text-[var(--color-text)]">{formatBytes(detail.outputBytes)}{detail.outputTruncated ? " (已截断)" : ""}</span>
+                        </div>
+                        <div class="flex flex-col gap-0.5">
+                          <span class="text-[11px] text-[var(--color-text-muted)]">耗时</span>
+                          <span class="font-mono font-medium text-[var(--color-text)]">{detail.durationMs} ms</span>
+                        </div>
                       </div>
                       <div class="flex flex-col gap-0.5 border-t border-[var(--color-border)]/60 pt-2.5 col-span-2 sm:col-span-3 md:col-span-4">
                         <span class="text-[11px] text-[var(--color-text-muted)]">请求 ID</span>
