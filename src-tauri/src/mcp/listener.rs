@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Form, Query, State};
 use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
@@ -11,13 +12,14 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 
+use crate::audit::request_context_from_headers;
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
     protected_resource_metadata, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
     AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
 };
-use crate::audit::request_context_from_headers;
 use crate::mcp::server::{handle_request_with_context, new_state, SharedState};
+use crate::mcp::upstream::UpstreamMcpManager;
 use crate::secret::SecretStore;
 use crate::tools::Workspace;
 use crate::tunnel::append_profile_log;
@@ -50,9 +52,23 @@ pub fn spawn_listener(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
+    upstream: Arc<UpstreamMcpManager>,
 ) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
     let workspace_display = workspace_path.display().to_string();
     let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
+    if matches!(
+        crate::tools::registry::normalize_tool_profile(&runtime.tool_profile),
+        "read-only" | "compat-readonly-all"
+    ) && !upstream.public_tools().is_empty()
+    {
+        return Err(
+            "只读工具档位不能公开本地 MCP 工具；请切换到核心或完整工具档位后再启动"
+                .to_string(),
+        );
+    }
+    // Bind before starting local children. A port collision must not leave an
+    // upstream process running after this MCP start attempt failed.
+    let listener = bind_listener(port)?;
     let policy = PolicySettings::from_runtime(&runtime);
     // 监听器创建 SharedState 时注入稳定 workspace_id；服务端后续只持有共享 Context，无法再从
     // 单条 JSON-RPC 请求可靠恢复工作区归属。
@@ -63,6 +79,7 @@ pub fn spawn_listener(
         policy,
         runtime.tool_profile.clone(),
         runtime.permission_mode.clone(),
+        upstream,
     );
     let bearer_token = if auth.bearer_enabled() {
         let key = "bearer_token";
@@ -104,8 +121,6 @@ pub fn spawn_listener(
         oauth,
         oauth_client_secret,
     };
-    // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
-    let listener = bind_listener(port)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = state.workspace_id.clone();
     let handle = tauri::async_runtime::spawn(async move {
@@ -131,6 +146,7 @@ async fn serve(
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let profile_id = state.workspace_id.clone();
+    let upstream = state.mcp.upstream.clone();
     // access 中间件包在完整 MCP Router 外层，统一记录协议、OAuth、discovery 与 404；"mcp"
     // 分区避免和同工作区 Actions 日志混写。
     let access_log_state =
@@ -159,11 +175,13 @@ async fn serve(
         "stdout.log",
         &format!("[mcp] listening on http://127.0.0.1:{port}/mcp"),
     );
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = shutdown.await;
         })
-        .await?;
+        .await;
+    upstream.shutdown().await;
+    result?;
     Ok(())
 }
 
@@ -214,6 +232,8 @@ async fn mcp_post(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let is_upstream_tool = state.mcp.upstream.owns_tool(&tool_name);
+    let started_at = Instant::now();
     // 在 body 移入 blocking 执行前提取 headers 与 JSON-RPC id，使服务端审计获得完整请求上下文；
     // id 只做协议关联，记录唯一性仍由审计 UUID 保证。
     let request_context = request_context_from_headers(
@@ -275,6 +295,24 @@ async fn mcp_post(
                     ),
                 );
             }
+            if is_upstream_tool {
+                let is_error = response
+                    .get("result")
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                append_profile_log(
+                    &profile_id,
+                    "mcp-requests.log",
+                    &format!(
+                        "[upstream] completed id={} tool={} is_error={} duration_ms={}",
+                        request_id,
+                        tool_name,
+                        is_error,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+            }
             Json(response).into_response()
         }
         Err(error) => {
@@ -286,6 +324,18 @@ async fn mcp_post(
                     request_id, method, tool_name
                 ),
             );
+            if is_upstream_tool {
+                append_profile_log(
+                    &profile_id,
+                    "mcp-requests.log",
+                    &format!(
+                        "[upstream] failed id={} tool={} duration_ms={}",
+                        request_id,
+                        tool_name,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+            }
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
