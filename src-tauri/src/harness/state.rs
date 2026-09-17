@@ -482,29 +482,32 @@ impl Harness {
 
 pub fn capture_baseline(root: &Path) -> ProjectBaseline {
     let mut entries = Vec::new();
+    // Prune skipped directories (OneDrive, node_modules, …) so WalkDir does not
+    // descend into them — hashing alone is not enough for home-dir workspaces.
     for item in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| entry.path() == root || !should_skip(entry.path(), root))
         .filter_map(Result::ok)
     {
         let path = item.path();
-        if path == root || should_skip(path, root) || !item.file_type().is_file() {
+        if path == root || !item.file_type().is_file() {
             continue;
         }
-        let Ok(bytes) = fs::read(path) else { continue };
+        let Some((sha256, is_binary, byte_len)) = hash_file_bounded(path) else {
+            continue;
+        };
         let rel = path
             .strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
         entries.push(BaselineEntry {
             path: rel,
             exists: true,
-            is_binary: bytes.contains(&0),
-            sha256: format!("{:x}", hasher.finalize()),
-            bytes: bytes.len() as u64,
+            is_binary,
+            sha256,
+            bytes: byte_len,
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -523,24 +526,75 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
     }
 }
 
+/// Stream a file in fixed 64 KiB chunks: O(buffer) memory regardless of file
+/// size, so a multi-GB file inside a large workspace cannot spike RSS during
+/// baseline capture. Returns (sha256, is_binary, total_bytes).
+fn hash_file_bounded(path: &Path) -> Option<(String, bool, u64)> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut is_binary = false;
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buf[..read];
+        if !is_binary && chunk.contains(&0) {
+            is_binary = true;
+        }
+        hasher.update(chunk);
+        total += read as u64;
+    }
+    Some((format!("{:x}", hasher.finalize()), is_binary, total))
+}
+
 fn should_skip(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root)
         .ok()
         .into_iter()
         .flat_map(|p| p.components())
         .filter_map(|component| component.as_os_str().to_str())
-        .any(|name| {
-            matches!(
-                name,
-                ".git"
-                    | ".mcp-probe-kit"
-                    | "node_modules"
-                    | "target"
-                    | "dist"
-                    | "build"
-                    | ".svelte-kit"
-            )
-        })
+        .any(is_skipped_component)
+}
+
+fn is_skipped_component(name: &str) -> bool {
+    if matches!(
+        name,
+        ".git"
+            | ".mcp-probe-kit"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".svelte-kit"
+            | ".cache"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | ".next"
+            | ".turbo"
+            | "coverage"
+    ) {
+        return true;
+    }
+    // OS / cloud roots: compare case-insensitively (Windows folder casing varies).
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "library"
+            | "onedrive"
+            | "onedrivetemp"
+            | "appdata"
+            | "application data"
+            | "windows"
+            | "program files"
+            | "program files (x86)"
+            | "programdata"
+            | "$recycle.bin"
+            | "system volume information"
+    )
 }
 
 fn git_value(root: &Path, args: &[&str]) -> Option<String> {
@@ -615,5 +669,27 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[test]
+    fn capture_baseline_prunes_skipped_directories() {
+        let root = tempdir().expect("root");
+        fs::create_dir_all(root.path().join("OneDrive").join("deep")).expect("onedrive");
+        fs::write(root.path().join("OneDrive").join("deep").join("cloud.bin"), vec![0u8; 1024])
+            .expect("cloud file");
+        fs::create_dir_all(root.path().join("node_modules").join("pkg")).expect("nm");
+        fs::write(
+            root.path().join("node_modules").join("pkg").join("index.js"),
+            "module.exports=1\n",
+        )
+        .expect("nm file");
+        fs::write(root.path().join("keep.txt"), "hello\n").expect("keep");
+
+        let baseline = capture_baseline(root.path());
+        let paths: Vec<&str> = baseline.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["keep.txt"]);
+        assert!(is_skipped_component("onedrive"));
+        assert!(is_skipped_component("OneDrive"));
+        assert!(is_skipped_component("LIBRARY"));
     }
 }
