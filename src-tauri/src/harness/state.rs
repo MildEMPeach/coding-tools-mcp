@@ -325,11 +325,28 @@ impl Harness {
     }
 
     pub fn status(&self) -> HarnessResult<HarnessStatus> {
-        let current = capture_baseline(&self.workspace_root);
+        self.status_with_baseline(|| capture_baseline(&self.workspace_root))
+    }
+
+    fn status_with_baseline(
+        &self,
+        capture: impl FnOnce() -> ProjectBaseline,
+    ) -> HarnessResult<HarnessStatus> {
         let task = self.current_task()?;
+        // Standalone errors/status need Git metadata, not a snapshot of every
+        // file. A home-directory workspace may contain OS-protected media.
+        let current = task.as_ref().map(|_| capture());
+        let (branch, head) = match current.as_ref() {
+            Some(current) => (current.branch.clone(), current.head.clone()),
+            None => (
+                git_value(&self.workspace_root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+                git_value(&self.workspace_root, &["rev-parse", "HEAD"]),
+            ),
+        };
         let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
+                    let current = current.as_ref().expect("active task has a baseline");
                     let matches = task.baseline.branch == current.branch
                         && task.baseline.head == current.head
                         && task.expected_fingerprint == current.worktree_fingerprint;
@@ -403,13 +420,13 @@ impl Harness {
         capabilities.insert(
             "git".into(),
             CapabilityStatus {
-                status: if current.branch.is_some() && current.head.is_some() {
+                status: if branch.is_some() && head.is_some() {
                     "available"
                 } else {
                     "degraded"
                 }
                 .into(),
-                reason: if current.branch.is_some() && current.head.is_some() {
+                reason: if branch.is_some() && head.is_some() {
                     "已读取当前分支和 HEAD"
                 } else {
                     "当前工作区不是可读取 Git 状态的仓库"
@@ -449,8 +466,8 @@ impl Harness {
             writable,
             reason,
             recoverable: true,
-            branch: current.branch,
-            head: current.head,
+            branch,
+            head,
             baseline_matches,
             capabilities,
             next_actions,
@@ -632,6 +649,19 @@ fn timestamp() -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn standalone_status_never_reads_workspace_file_contents() {
+        let workspace = tempdir().unwrap();
+        let harness_root = tempdir().unwrap();
+        fs::create_dir(workspace.path().join("Music")).unwrap();
+        fs::write(workspace.path().join("Music/private-library"), "unrelated data").unwrap();
+        let harness = Harness::new(workspace.path().to_path_buf(), harness_root.path().to_path_buf()).unwrap();
+        let status = harness.status_with_baseline(|| panic!("standalone status must not scan files")).unwrap();
+        assert!(status.task_id.is_none());
+        assert!(status.writable);
+        assert_eq!(status.baseline_matches, None);
+    }
 
     #[test]
     fn status_keeps_read_available_without_task() {

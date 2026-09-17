@@ -189,7 +189,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         && output.get("ok") == Some(&Value::Bool(true))
     {
         let hint = if output.get("status").and_then(Value::as_str) == Some("running") {
-            "命令仍在运行；使用 session_id 调用 read_output 或 write_stdin 取得最终结果。"
+            "命令仍在运行；使用 session_id 调用 write_stdin（chars 为空）等待完成；使用 output_refs 调用 read_output 读取输出。"
         } else if output.get("command_ok") == Some(&Value::Bool(false)) {
             "命令未成功；请检查 stderr、exit_code 或调整参数后重试。"
         } else {

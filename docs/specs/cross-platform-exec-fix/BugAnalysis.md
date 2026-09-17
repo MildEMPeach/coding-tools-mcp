@@ -41,7 +41,20 @@ is present in upstream 8886513.
 - Test successful writes, cwd equivalence, venv prefix, Windows quoting, missing
   executable, running/nonzero status, traversal, external paths and symlink escapes.
 - Run Rust unit/integration tests, frontend checks and diff checks. Build committed
-  0.2.2 candidates, then validate real MCP writes and error responses on both OSes.
+  0.2.3 candidates, then validate real MCP writes and error responses on both OSes.
 
 This retains the existing `policy_only` execution boundary; it does not introduce
 an OS sandbox or enable workspace-external writes.
+
+## Native validation finding: unrelated media permission prompts
+
+On a home-directory workspace, a missing executable triggered a media-library
+permission prompt and delayed the error response. `attach_harness_status` calls
+`Harness::status`, which unconditionally captured every workspace file even when
+there was no active task. Returning a truthful spawn error exposed this existing
+status side effect. Standalone status now reads only Git branch/HEAD; full baseline
+comparison remains limited to an explicitly active task. A regression uses a
+snapshot provider that fails if standalone status attempts any file scan.
+
+The running hint distinguishes `write_stdin(session_id, chars="")` from
+`read_output(output_ref)`, matching their actual schemas.
