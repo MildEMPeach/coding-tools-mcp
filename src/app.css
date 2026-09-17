@@ -250,6 +250,9 @@ button {
 }
 
 .page-header {
+  /* 审计页刷新菜单从页头向下展开；在公共页头建立层叠上下文，确保菜单覆盖正文卡片。 */
+  position: relative;
+  z-index: 30;
   padding: 24px 28px 20px;
   border-bottom: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.35);

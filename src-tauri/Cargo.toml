@@ -38,9 +38,14 @@ zip = "2"
 flate2 = "1"
 tar = "0.4"
 fs2 = "0.4"
+# 审计库内置 SQLite，避免桌面端依赖系统动态库；访问日志只启用本地时钟与标准库。
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
+# 仅用于通过 Router::oneshot 验证 access 中间件，不进入生产依赖。
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

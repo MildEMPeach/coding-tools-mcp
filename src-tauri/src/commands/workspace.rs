@@ -3,8 +3,10 @@ use std::path::PathBuf;
 use tauri::State;
 
 use crate::app_state::{bootstrap_workspace, teardown_workspace, AppState};
+use crate::audit::AuditStore;
 use crate::error::{AppError, AppResult};
 use crate::platform::open_path_in_file_manager;
+use crate::runtime::{await_listener_shutdown_for_delete, ServiceKind};
 use crate::tunnel::drop_workspace as drop_tunnel_workspace;
 use crate::workspace::resources::{
     assign_free_workspace_ports, validate_workspace_resources_update,
@@ -52,22 +54,44 @@ pub fn open_workspace_directory(path: String) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()> {
     let profile = state.with_workspaces(|store| {
         store
             .get(&id)
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
     })?;
-    tauri::async_runtime::block_on(drop_tunnel_workspace(&id))?;
-    state.with_runtime(|runtime| {
-        runtime.drop_workspace(&profile);
-        Ok(())
-    })?;
+    drop_tunnel_workspace(&id).await?;
+    // listener 退出会等待在途请求及其日志写入；完成后才能删除 profile 日志目录。
+    for (kind, port) in [
+        (ServiceKind::Mcp, profile.runtime.local_port),
+        (ServiceKind::Actions, profile.actions.local_port),
+    ] {
+        let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(&id, kind)))?;
+        await_listener_shutdown_for_delete(handle, port).await;
+        state.with_runtime(|runtime| {
+            runtime.finish_stop(&id, kind);
+            Ok(())
+        })?;
+    }
     state.with_workspaces(|store| {
         if store.remove(&id)?.is_some() {
             teardown_workspace(store, &id)?;
         }
         Ok(())
-    })
+    })?;
+
+    // 日志是 profile 删除后的旁路清理；失败只告警，不能回滚已完成的工作区删除。
+    if let Err(error) = crate::access_log::remove_workspace_logs(&id) {
+        eprintln!("workspace access log cleanup failed: {error}");
+    }
+    match AuditStore::open_default() {
+        Ok(audit) => {
+            if let Err(error) = audit.remove_workspace_records(&id) {
+                eprintln!("workspace audit cleanup failed: {error}");
+            }
+        }
+        Err(error) => eprintln!("workspace audit cleanup skipped: {error}"),
+    }
+    Ok(())
 }

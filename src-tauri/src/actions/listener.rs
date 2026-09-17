@@ -18,6 +18,7 @@ use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
     token_exchange, AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
 };
+use crate::audit::request_context_from_headers;
 use crate::tools::{self, is_allowed_tool, policy::PolicySettings, wrap_tool_result, ToolContext};
 use crate::tunnel::append_profile_log;
 
@@ -135,6 +136,8 @@ async fn serve(
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace = tools::Workspace::new(workspace_path.clone()).map_err(|e| e.message())?;
+    // 在 ToolContext 进入 Arc 前绑定审计库与 profile_id，使所有 Actions 路由共享同一工作区身份；
+    // with_audit 初始化失败时仅关闭审计，不阻断服务启动。
     let ctx = Arc::new(ToolContext::from_workspace(
         workspace,
         crate::workspace::AuthConfig {
@@ -144,7 +147,7 @@ async fn serve(
         policy.clone(),
         "full".into(),
         policy.permission_mode.clone(),
-    ));
+    ).with_audit(profile_id.to_string()));
     let tools: Vec<Value> = tools::list_tools()
         .into_iter()
         .filter(|tool| {
@@ -180,6 +183,13 @@ async fn serve(
         oauth_client_secret,
         write_lock: Arc::new(Mutex::new(())),
     };
+    // access 中间件包在完整 Router 外层，以覆盖工具、OAuth、discovery 和 404；"actions"
+    // 分区使同一工作区内的 MCP 与 Actions 日志可独立查询。
+    let access_log_state = crate::access_log::AccessLogState::new(
+        profile_id.to_string(),
+        "actions",
+        state.ctx.audit_store(),
+    );
 
     let protected = Router::new()
         .route("/actions/{tool_name}", post(execute_action))
@@ -198,7 +208,11 @@ async fn serve(
         .route("/oauth/token", post(oauth_token_post))
         .merge(protected)
         .with_state(state)
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(
+            access_log_state,
+            crate::access_log::middleware,
+        ));
 
     append_profile_log(
         profile_id,
@@ -337,6 +351,7 @@ fn oauth_not_configured() -> Response {
 
 async fn execute_action(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(tool_name): Path<String>,
     body: Option<Json<Value>>,
 ) -> Response {
@@ -358,19 +373,37 @@ async fn execute_action(
         None => json!({}),
     };
 
+    // 参数归一化后、暴露策略检查前构造上下文：提前拒绝与正常执行由此共享同一组请求元数据。
+    let request = request_context_from_headers(
+        &headers,
+        "actions",
+        Some("POST".into()),
+        None,
+        Some(format!("/actions/{tool_name}")),
+    );
+
     if let Err(err) = tools::policy::validate_actions_exposure(&tool_name) {
+        let message = err.to_string();
+        tools::record_tool_rejection_with_audit(
+            state.ctx.as_ref(),
+            &request,
+            &tool_name,
+            &arguments,
+            "ACTION_NOT_EXPOSED",
+            &message,
+        );
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "detail": err.to_string() })),
+            Json(json!({ "detail": message })),
         )
             .into_response();
     }
 
     let structured = if tools::registry::MUTATING_TOOLS.contains(&tool_name.as_str()) {
         let _guard = state.write_lock.lock().await;
-        tools::call_tool(state.ctx.as_ref(), &tool_name, &arguments)
+        tools::call_tool_with_audit(state.ctx.as_ref(), &tool_name, &arguments, &request)
     } else {
-        tools::call_tool(state.ctx.as_ref(), &tool_name, &arguments)
+        tools::call_tool_with_audit(state.ctx.as_ref(), &tool_name, &arguments, &request)
     };
     let result = wrap_tool_result(structured);
     let is_error = result

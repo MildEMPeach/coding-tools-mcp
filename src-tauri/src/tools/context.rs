@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::audit::AuditStore;
 use crate::harness::Harness;
 use crate::tools::policy::PolicySettings;
 use crate::tools::session::SessionStore;
@@ -14,6 +15,10 @@ pub struct ToolContext {
     pub tool_profile: String,
     pub permission_mode: String,
     pub harness: Harness,
+    // 审计附着在现有 ToolContext，避免修改全部工具签名；生产监听器显式启用，测试与内部
+    // 构造保持 None。正式 profile_id 绑定前暂用 Harness 的稳定工作区 ID 作为兼容标签。
+    audit: Option<AuditStore>,
+    audit_workspace_id: String,
     default_cwd: Mutex<PathBuf>,
     pub sessions: Arc<SessionStore>,
 }
@@ -63,13 +68,17 @@ impl ToolContext {
         harness_root: PathBuf,
     ) -> Self {
         let root = workspace.root().to_path_buf();
+        let harness = Harness::new(root.clone(), harness_root).expect("无法初始化 Harness");
+        let audit_workspace_id = harness.workspace_id().to_string();
         Self {
             workspace,
             auth,
             policy,
             tool_profile: crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
             permission_mode,
-            harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
+            harness,
+            audit: None,
+            audit_workspace_id,
             default_cwd: Mutex::new(root),
             sessions: Arc::new(SessionStore::new()),
         }
@@ -94,6 +103,26 @@ impl ToolContext {
         self.workspace.root_display()
     }
 
+    // 此步骤位于 profile_id 已确定、Context 尚未进入 Arc 的构造末端；开库失败时降级为
+    // 无审计，不能影响工具服务可用性。
+    pub fn with_audit(mut self, workspace_id: impl Into<String>) -> Self {
+        let workspace_id = workspace_id.into();
+        if !workspace_id.trim().is_empty() {
+            match AuditStore::open_default() {
+                Ok(audit) => {
+                    self.audit = Some(audit);
+                }
+                Err(error) => eprintln!("audit store disabled: {error}"),
+            }
+            self.audit_workspace_id = workspace_id;
+        }
+        self
+    }
+
+    pub fn audit_workspace_id(&self) -> &str {
+        &self.audit_workspace_id
+    }
+
     pub fn default_cwd_display(&self) -> String {
         let cwd = self.default_cwd.lock().expect("cwd lock");
         relative_display(self.workspace.root(), &cwd)
@@ -105,5 +134,9 @@ impl ToolContext {
 
     pub fn default_cwd_path(&self) -> PathBuf {
         self.default_cwd.lock().expect("cwd lock").clone()
+    }
+
+    pub fn audit_store(&self) -> Option<AuditStore> {
+        self.audit.clone()
     }
 }

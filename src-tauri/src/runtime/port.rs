@@ -189,6 +189,20 @@ pub async fn await_listener_shutdown(handle: Option<JoinHandle<()>>, port: u16) 
     }
 }
 
+/// 删除工作区前等待 listener 完整退出，不使用普通停止流程的三秒强制中止。
+///
+/// Axum 已接收的连接拥有独立任务；中止外层 server future 不会同步取消这些任务。删除流程
+/// 必须等它们完成请求与日志写入后再清理目录，避免已删除的日志被在途请求重新创建。
+pub async fn await_listener_shutdown_for_delete(handle: Option<JoinHandle<()>>, port: u16) {
+    if let Some(handle) = handle {
+        let _ = handle.await;
+    }
+
+    if !wait_for_port_free(port, Duration::from_secs(2)).await {
+        let _ = try_reclaim_own_port(port);
+    }
+}
+
 pub fn await_listener_shutdown_blocking(handle: Option<JoinHandle<()>>, port: u16) {
     if let Some(handle) = handle {
         // begin_stop 已经发送了优雅退出信号。这里必须等待监听端口真正释放，

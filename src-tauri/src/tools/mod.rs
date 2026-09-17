@@ -12,8 +12,9 @@ pub mod session;
 pub mod workspace;
 
 pub use context::{SharedToolContext, ToolContext};
-/// 唯一工具执行入口；MCP 与 Actions 必须调用此函数，不得分叉实现。
-pub use dispatch::call_tool;
+/// 工具执行仍唯一收敛到 call_tool；传输入口用 call_tool_with_audit 包装正常调用，
+/// 提前拒绝用 record_tool_rejection_with_audit 补记，禁止 MCP/Actions 各自复制审计逻辑。
+pub use dispatch::{call_tool, call_tool_with_audit, record_tool_rejection_with_audit};
 pub use policy::{validate_actions_exposure, PolicySettings};
 pub use registry::{
     exposed_tool_names, is_allowed_tool, list_tools, list_tools_for_profile, MUTATING_TOOLS,
