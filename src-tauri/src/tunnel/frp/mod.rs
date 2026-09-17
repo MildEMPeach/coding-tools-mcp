@@ -58,6 +58,7 @@ pub(crate) struct FrpServerConfig {
     pub server_addr: String,
     pub server_port: u16,
     pub token: Option<String>,
+    pub tls_enable: bool,
     pub proxy: FrpProxyConfig,
 }
 
@@ -98,11 +99,19 @@ pub fn frp_server_config(
         ),
     };
 
-    let (server_addr, server_port) =
+    let (server_addr, server_port, tls_enable) =
         if let Some(frp_profile) = settings.find_frp_profile(profile_id) {
-            (frp_profile.server.clone(), frp_profile.server_port)
+            (
+                frp_profile.server.clone(),
+                frp_profile.server_port,
+                frp_profile.tls_enable,
+            )
         } else {
-            (server_addr, server_port)
+            let tls = match kind {
+                TunnelServiceKind::Mcp => profile.tunnel.frp_tls,
+                TunnelServiceKind::Actions => profile.actions.frp_tls,
+            };
+            (server_addr, server_port, tls)
         };
 
     let token = token_override.or_else(|| resolve_frp_token(profile_id, profile, kind, settings));
@@ -111,6 +120,7 @@ pub fn frp_server_config(
         server_addr,
         server_port,
         token,
+        tls_enable,
         proxy,
     }
 }
@@ -176,7 +186,7 @@ pub fn build_frpc_toml(config: &FrpServerConfig) -> String {
         lines.push(format!("auth.token = \"{}\"", token.trim()));
         lines.push(String::new());
     }
-    append_frpc_transport_settings(&mut lines);
+    append_frpc_transport_settings(&mut lines, config.tls_enable);
     lines.push(build_proxy_snippet(&config.proxy));
     lines.join("\n")
 }
@@ -201,7 +211,7 @@ pub(crate) fn build_frpc_toml_for_routes(configs: &[FrpServerConfig]) -> String 
         lines.push(format!("auth.token = \"{}\"", token.trim()));
         lines.push(String::new());
     }
-    append_frpc_transport_settings(&mut lines);
+    append_frpc_transport_settings(&mut lines, first.tls_enable);
 
     let mut used_names = HashSet::new();
     for config in configs {
@@ -249,11 +259,17 @@ fn frp_proxy_config(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> FrpP
     }
 }
 
-fn append_frpc_transport_settings(lines: &mut Vec<String>) {
+fn append_frpc_transport_settings(lines: &mut Vec<String>, tls_enable: bool) {
     // Keep retrying through overnight router outages instead of exiting once.
     lines.push("loginFailExit = false".to_string());
     lines.push("transport.heartbeatInterval = 30".to_string());
     lines.push("transport.heartbeatTimeout = 90".to_string());
+    if tls_enable {
+        // Campus/corp networks often require TLS to the frps control port.
+        lines.push("transport.protocol = \"tcp\"".to_string());
+        lines.push("transport.tls.enable = true".to_string());
+        lines.push("transport.tls.disableCustomTLSFirstByte = true".to_string());
+    }
     lines.push(String::new());
 }
 
@@ -299,6 +315,7 @@ mod tests {
                 name: "Main".into(),
                 server: "frp.example.com".into(),
                 server_port: 7000,
+                tls_enable: false,
             }],
             ..AppSettings::default()
         };
@@ -324,6 +341,7 @@ mod tests {
                 name: "Main".into(),
                 server: "frp.example.com".into(),
                 server_port: 7000,
+                tls_enable: false,
             }],
             ..AppSettings::default()
         };
@@ -339,6 +357,41 @@ mod tests {
         assert!(toml.contains("loginFailExit = false"));
         assert!(toml.contains("transport.heartbeatInterval = 30"));
         assert!(toml.contains("transport.heartbeatTimeout = 90"));
+        assert!(!toml.contains("transport.tls.enable"));
+    }
+
+    #[test]
+    fn build_frpc_toml_includes_tls_when_profile_enables_it() {
+        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
+        profile.tunnel.frp_subdomain = "demo".into();
+        profile.tunnel.frp_profile_id = "p1".into();
+        let settings = AppSettings {
+            frp_profiles: vec![FrpProfile {
+                id: "p1".into(),
+                name: "Main".into(),
+                server: "frp.example.com".into(),
+                server_port: 7000,
+                tls_enable: true,
+            }],
+            ..AppSettings::default()
+        };
+        let config = frp_server_config(&profile, TunnelServiceKind::Mcp, &settings, None);
+        let toml = build_frpc_toml(&config);
+        assert!(toml.contains("transport.protocol = \"tcp\""));
+        assert!(toml.contains("transport.tls.enable = true"));
+        assert!(toml.contains("transport.tls.disableCustomTLSFirstByte = true"));
+        assert!(toml.contains("loginFailExit = false"));
+    }
+
+    #[test]
+    fn build_frpc_toml_includes_tls_for_legacy_workspace_flag() {
+        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
+        profile.tunnel.frp_server = "frp.example.com".into();
+        profile.tunnel.frp_subdomain = "demo".into();
+        profile.tunnel.frp_tls = true;
+        let config = frp_server_config(&profile, TunnelServiceKind::Mcp, &AppSettings::default(), None);
+        let toml = build_frpc_toml(&config);
+        assert!(toml.contains("transport.tls.enable = true"));
     }
 
     #[test]
@@ -472,6 +525,7 @@ mod tests {
                 name: "Main".into(),
                 server: "frp.example.com".into(),
                 server_port: 7000,
+                tls_enable: false,
             }],
             ..AppSettings::default()
         };

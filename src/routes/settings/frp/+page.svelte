@@ -16,6 +16,7 @@
   let name = $state("");
   let server = $state("");
   let serverPort = $state(7000);
+  let tlsEnable = $state(false);
   let token = $state("");
 
   async function refresh() {
@@ -32,6 +33,7 @@
     name = "";
     server = "";
     serverPort = 7000;
+    tlsEnable = false;
     token = "";
   }
 
@@ -40,6 +42,7 @@
     name = profile.name;
     server = profile.server;
     serverPort = profile.serverPort;
+    tlsEnable = profile.tlsEnable ?? false;
     token = "";
   }
 
@@ -56,6 +59,7 @@
           name: name.trim(),
           server: server.trim(),
           serverPort,
+          tlsEnable,
         },
         token.trim() || undefined,
       );
@@ -141,6 +145,15 @@
             showCopy={false}
           />
         </label>
+        <label class="flex items-start gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2.5">
+          <input type="checkbox" class="mt-0.5 h-4 w-4" bind:checked={tlsEnable} />
+          <span class="grid gap-0.5">
+            <span class="text-xs font-medium">启用 TLS</span>
+            <span class="text-[11px] text-[var(--color-text-muted)]">
+              生成 frpc.toml 时写入 transport.tls.enable（校园网/公司网场景）。需 frps 支持 TLS。
+            </span>
+          </span>
+        </label>
         <div class="flex gap-2 pt-1">
           <button
             type="submit"
@@ -179,6 +192,7 @@
                 <p class="truncate font-mono text-xs text-[var(--color-text-muted)]">
                   {profile.server}:{profile.serverPort}
                   · Token {profile.hasToken ? "已配置" : "未配置"}
+                  · TLS {profile.tlsEnable ? "开" : "关"}
                 </p>
               </div>
               <div class="flex shrink-0 gap-2">

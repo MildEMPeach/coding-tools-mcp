@@ -22,6 +22,8 @@ pub struct FrpProfileDto {
 
     pub server_port: u16,
 
+    pub tls_enable: bool,
+
     pub has_token: bool,
 
 }
@@ -59,6 +61,8 @@ pub fn list_frp_profiles(state: State<'_, AppState>) -> AppResult<Vec<FrpProfile
                     server: profile.server.clone(),
 
                     server_port: profile.server_port,
+
+                    tls_enable: profile.tls_enable,
 
                     has_token,
 
@@ -163,6 +167,8 @@ pub fn save_frp_profile(
         server: saved.server,
 
         server_port: saved.server_port,
+
+        tls_enable: saved.tls_enable,
 
         has_token,
 

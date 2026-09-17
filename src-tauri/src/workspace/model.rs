@@ -33,6 +33,10 @@ pub struct TunnelConfig {
     /// When true, start cloudflared with `--protocol http2` instead of default QUIC.
     #[serde(default = "default_cloudflare_http2")]
     pub cloudflare_http2: bool,
+    /// Legacy manual FRP: enable transport TLS in generated frpc.toml.
+    /// Ignored when `frp_profile_id` resolves to a global profile (profile.tls_enable wins).
+    #[serde(default)]
+    pub frp_tls: bool,
     /// When true, apply global proxy from Settings → General when starting the tunnel.
     #[serde(default = "default_use_proxy")]
     pub use_proxy: bool,
@@ -87,6 +91,9 @@ pub struct ActionsConfig {
     pub cloudflare_token: String,
     #[serde(default = "default_cloudflare_http2")]
     pub cloudflare_http2: bool,
+    /// Legacy manual FRP TLS; ignored when an FRP profile is selected.
+    #[serde(default)]
+    pub frp_tls: bool,
     #[serde(default = "default_use_proxy")]
     pub use_proxy: bool,
     #[serde(default = "default_actions_port")]
@@ -202,6 +209,7 @@ impl Default for TunnelConfig {
             frp_server_port: default_frp_server_port(),
             cloudflare_mode: default_cloudflare_mode(),
             cloudflare_http2: default_cloudflare_http2(),
+            frp_tls: false,
             use_proxy: default_use_proxy(),
         }
     }
@@ -243,6 +251,7 @@ impl Default for ActionsConfig {
             cloudflare_mode: default_cloudflare_mode(),
             cloudflare_token: String::new(),
             cloudflare_http2: default_cloudflare_http2(),
+            frp_tls: false,
             use_proxy: default_use_proxy(),
             local_port: default_actions_port(),
             permission_mode: default_permission_mode(),

@@ -88,6 +88,7 @@ fn restore_tunnel_config(
                 current.actions.cloudflare_mode = restored.actions.cloudflare_mode.clone();
                 current.actions.cloudflare_token = restored.actions.cloudflare_token.clone();
                 current.actions.cloudflare_http2 = restored.actions.cloudflare_http2;
+                current.actions.frp_tls = restored.actions.frp_tls;
                 current.actions.use_proxy = restored.actions.use_proxy;
             }
         }
@@ -107,6 +108,7 @@ fn mcp_tunnel_matches(
         && left.tunnel.frp_server_port == right.tunnel.frp_server_port
         && left.tunnel.cloudflare_mode == right.tunnel.cloudflare_mode
         && left.tunnel.cloudflare_http2 == right.tunnel.cloudflare_http2
+        && left.tunnel.frp_tls == right.tunnel.frp_tls
         && left.tunnel.use_proxy == right.tunnel.use_proxy
 }
 
@@ -123,6 +125,7 @@ fn actions_tunnel_matches(
         && left.actions.cloudflare_mode == right.actions.cloudflare_mode
         && left.actions.cloudflare_token == right.actions.cloudflare_token
         && left.actions.cloudflare_http2 == right.actions.cloudflare_http2
+        && left.actions.frp_tls == right.actions.frp_tls
         && left.actions.use_proxy == right.actions.use_proxy
 }
 

@@ -95,6 +95,7 @@
     frp_server_port: profile?.tunnel.frp_server_port ?? 7000,
     cloudflare_mode: profile?.tunnel.cloudflare_mode ?? "quick",
     cloudflare_http2: profile?.tunnel.cloudflare_http2 ?? true,
+    frp_tls: profile?.tunnel.frp_tls ?? false,
     use_proxy: profile?.tunnel.use_proxy ?? true,
   });
 
@@ -107,6 +108,7 @@
     frp_server_port: actions?.frp_server_port ?? 7000,
     cloudflare_mode: actions?.cloudflare_mode ?? "quick",
     cloudflare_http2: actions?.cloudflare_http2 ?? true,
+    frp_tls: actions?.frp_tls ?? false,
     use_proxy: actions?.use_proxy ?? true,
   });
 
@@ -348,6 +350,7 @@
         frp_server_port: config.frp_server_port,
         cloudflare_mode: config.cloudflare_mode,
         cloudflare_http2: config.cloudflare_http2,
+        frp_tls: config.frp_tls,
         use_proxy: config.use_proxy,
       },
     };
@@ -384,6 +387,7 @@
         frp_server_port: config.frp_server_port,
         cloudflare_mode: config.cloudflare_mode,
         cloudflare_http2: config.cloudflare_http2,
+        frp_tls: config.frp_tls,
         use_proxy: config.use_proxy,
       },
     };
