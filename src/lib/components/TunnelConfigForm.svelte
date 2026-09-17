@@ -14,6 +14,7 @@
     frp_server_port: number;
     cloudflare_mode: string;
     cloudflare_http2: boolean;
+    frp_tls: boolean;
     use_proxy: boolean;
   }
 
@@ -40,6 +41,7 @@
     frp_server_port: 7000,
     cloudflare_mode: "quick",
     cloudflare_http2: true,
+    frp_tls: false,
     use_proxy: true,
   });
   let saving = $state(false);
@@ -74,6 +76,7 @@
       draft.frp_server_port !== config.frp_server_port ||
       draft.cloudflare_mode !== config.cloudflare_mode ||
       draft.cloudflare_http2 !== config.cloudflare_http2 ||
+      draft.frp_tls !== config.frp_tls ||
       draft.use_proxy !== config.use_proxy ||
       tokenPending,
   );
@@ -89,6 +92,7 @@
       ...config,
       frp_profile_id: config.frp_profile_id ?? "",
       cloudflare_http2: config.cloudflare_http2 ?? true,
+      frp_tls: config.frp_tls ?? false,
       use_proxy: config.use_proxy ?? true,
     };
   });
@@ -283,6 +287,26 @@
           label="FRP Token（可选）"
         />
       {/if}
+    {/if}
+
+    {#if !useGlobalProfile}
+      <label class="flex items-start gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2.5">
+        <input
+          type="checkbox"
+          class="mt-0.5 h-4 w-4"
+          bind:checked={draft.frp_tls}
+        />
+        <span class="grid gap-0.5">
+          <span class="text-xs font-medium text-[var(--color-text-secondary)]">启用 FRP TLS</span>
+          <span class="text-[11px] text-[var(--color-text-muted)]">
+            校园网/公司网无法明文连接 frps 时开启。将写入 transport.tls.enable 等配置；需服务端支持 TLS。
+          </span>
+        </span>
+      </label>
+    {:else}
+      <p class="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-[11px] text-[var(--color-text-muted)]">
+        TLS：{selectedProfile?.tlsEnable ? "已在全局 FRP 配置中启用" : "未启用（可在 设置 → FRP 配置 中打开）"}
+      </p>
     {/if}
   {/if}
 

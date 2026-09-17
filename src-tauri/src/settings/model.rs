@@ -11,6 +11,9 @@ pub struct FrpProfile {
     pub server: String,
     #[serde(default = "default_frp_server_port", alias = "serverPort")]
     pub server_port: u16,
+    /// When true, generated frpc.toml enables transport TLS (campus/corp networks).
+    #[serde(default, alias = "tlsEnable")]
+    pub tls_enable: bool,
 }
 
 /// Download settings for fetching frpc / cloudflared binaries.
@@ -143,6 +146,7 @@ impl FrpProfile {
             name,
             server: server.trim().to_string(),
             server_port,
+            tls_enable: false,
         }
     }
 }
