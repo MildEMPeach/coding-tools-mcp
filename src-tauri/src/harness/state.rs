@@ -482,13 +482,16 @@ impl Harness {
 
 pub fn capture_baseline(root: &Path) -> ProjectBaseline {
     let mut entries = Vec::new();
+    // Prune skipped directories (OneDrive, node_modules, …) so WalkDir does not
+    // descend into them — hashing alone is not enough for home-dir workspaces.
     for item in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| entry.path() == root || !should_skip(entry.path(), root))
         .filter_map(Result::ok)
     {
         let path = item.path();
-        if path == root || should_skip(path, root) || !item.file_type().is_file() {
+        if path == root || !item.file_type().is_file() {
             continue;
         }
         let Some((sha256, is_binary, byte_len)) = hash_file_bounded(path) else {
@@ -554,36 +557,44 @@ fn should_skip(path: &Path, root: &Path) -> bool {
         .into_iter()
         .flat_map(|p| p.components())
         .filter_map(|component| component.as_os_str().to_str())
-        .any(|name| {
-            matches!(
-                name,
-                ".git"
-                    | ".mcp-probe-kit"
-                    | "node_modules"
-                    | "target"
-                    | "dist"
-                    | "build"
-                    | ".svelte-kit"
-                    | "Library"
-                    | ".cache"
-                    | "__pycache__"
-                    | ".venv"
-                    | "venv"
-                    | ".next"
-                    | ".turbo"
-                    | "coverage"
-                    | "OneDrive"
-                    | "OneDriveTemp"
-                    | "AppData"
-                    | "Application Data"
-                    | "Windows"
-                    | "Program Files"
-                    | "Program Files (x86)"
-                    | "ProgramData"
-                    | "$Recycle.Bin"
-                    | "System Volume Information"
-            )
-        })
+        .any(is_skipped_component)
+}
+
+fn is_skipped_component(name: &str) -> bool {
+    if matches!(
+        name,
+        ".git"
+            | ".mcp-probe-kit"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".svelte-kit"
+            | ".cache"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | ".next"
+            | ".turbo"
+            | "coverage"
+    ) {
+        return true;
+    }
+    // OS / cloud roots: compare case-insensitively (Windows folder casing varies).
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "library"
+            | "onedrive"
+            | "onedrivetemp"
+            | "appdata"
+            | "application data"
+            | "windows"
+            | "program files"
+            | "program files (x86)"
+            | "programdata"
+            | "$recycle.bin"
+            | "system volume information"
+    )
 }
 
 fn git_value(root: &Path, args: &[&str]) -> Option<String> {
@@ -658,5 +669,27 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[test]
+    fn capture_baseline_prunes_skipped_directories() {
+        let root = tempdir().expect("root");
+        fs::create_dir_all(root.path().join("OneDrive").join("deep")).expect("onedrive");
+        fs::write(root.path().join("OneDrive").join("deep").join("cloud.bin"), vec![0u8; 1024])
+            .expect("cloud file");
+        fs::create_dir_all(root.path().join("node_modules").join("pkg")).expect("nm");
+        fs::write(
+            root.path().join("node_modules").join("pkg").join("index.js"),
+            "module.exports=1\n",
+        )
+        .expect("nm file");
+        fs::write(root.path().join("keep.txt"), "hello\n").expect("keep");
+
+        let baseline = capture_baseline(root.path());
+        let paths: Vec<&str> = baseline.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["keep.txt"]);
+        assert!(is_skipped_component("onedrive"));
+        assert!(is_skipped_component("OneDrive"));
+        assert!(is_skipped_component("LIBRARY"));
     }
 }

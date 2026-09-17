@@ -175,6 +175,11 @@ fn read_file_streaming(
         );
     }
 
+    // Incomplete UTF-8 at EOF must match the in-memory path's from_utf8 error.
+    if !utf8_carry.is_empty() {
+        return Err(unsupported_encoding());
+    }
+
     // Trailing line without a final newline still counts (split_inclusive
     // semantics) and flushes any buffered selection bytes.
     if seen > 0 && last_byte != b'\n' {
@@ -962,5 +967,43 @@ mod streaming_tests {
         compare(body.clone(), 131_072, 200_000, None);
         compare(body.clone(), 131_072, 5, Some(3)); // end < start
         compare("no newline at all".repeat(1000), 64, 1, None); // single giant line
+    }
+
+    fn stream_bytes(bytes: &[u8]) -> Result<Value, WorkspaceError> {
+        let dir = std::env::temp_dir().join(format!("ctm-stream-adv-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.bin");
+        std::fs::write(&path, bytes).unwrap();
+        let result = read_file_streaming(&path, "f.bin", 1024, 1, None);
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    #[test]
+    fn incomplete_utf8_at_eof_errors() {
+        let err = stream_bytes(&[0xE4]).unwrap_err();
+        assert!(format!("{err:?}").contains("UNSUPPORTED_ENCODING") || format!("{err}").contains("utf-8"));
+    }
+
+    #[test]
+    fn incomplete_utf8_after_valid_line_errors() {
+        let mut bytes = b"hello\n".to_vec();
+        bytes.push(0xE4);
+        let err = stream_bytes(&bytes).unwrap_err();
+        assert!(format!("{err:?}").contains("UNSUPPORTED_ENCODING") || format!("{err}").contains("utf-8"));
+    }
+
+    #[test]
+    fn utf8_straddling_chunk_boundary_ok() {
+        let mut body = vec![b'x'; 65535];
+        body.extend_from_slice("中".as_bytes());
+        body.push(b'\n');
+        let dir = std::env::temp_dir().join(format!("ctm-stream-chunk-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, &body).unwrap();
+        let v = read_file_streaming(&path, "f.txt", 70_000, 1, None).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(v.get("content").and_then(|c| c.as_str()).unwrap().contains('中'));
     }
 }
