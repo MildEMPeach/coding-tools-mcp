@@ -1,3 +1,5 @@
+mod command_line;
+mod exec_paths;
 pub mod context;
 pub mod dispatch;
 pub mod exec;

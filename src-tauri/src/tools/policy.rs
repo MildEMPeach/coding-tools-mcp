@@ -7,6 +7,8 @@ use crate::tools::workspace::Workspace;
 use crate::workspace::ActionsConfig;
 
 use super::registry::is_allowed_tool;
+use super::command_line::split_command;
+use super::exec_paths::{contains_external_path, resolve_workdir};
 
 static NETWORK_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 static DANGEROUS_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -227,13 +229,19 @@ pub fn validate_command_for_workspace(
     for key in ["workdir", "cwd"] {
         if let Some(workdir) = arguments.get(key).and_then(Value::as_str) {
             let path = Path::new(workdir);
-            if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+            if path.components().any(|part| part == Component::ParentDir)
+                || (path.is_absolute() && workspace.is_none()) {
                 return Err(PolicyError(
                     "workdir must stay inside the configured workspace".into(),
                 ));
             }
+            if let Some(workspace) = workspace {
+                resolve_workdir(workspace, workdir).map_err(|e| PolicyError(e.message()))?;
+            }
         }
     }
+    let parts = split_command(command).map_err(|message| PolicyError(message.into()))?;
+    if parts.is_empty() { return Err(PolicyError("Empty command".into())); }
     if has_forbidden_shell_syntax(command) {
         return Err(PolicyError(
             "Shell chaining, redirection and expansion are not allowed".into(),
@@ -247,7 +255,7 @@ pub fn validate_command_for_workspace(
             "PROTECTED_REPOSITORY_ASSET: 禁止删除或递归清空 .git/.github".into(),
         ));
     }
-    if interpreter_mutation_pattern().is_match(command) && command_contains_external_path(command) {
+    if interpreter_mutation_pattern().is_match(command) && contains_external_path(&parts[1..], workspace) {
         return Err(PolicyError(
             "WORKSPACE_PATH_PROTECTED: workspace scope 禁止通过子进程写入 Workspace 外部路径"
                 .into(),
@@ -273,12 +281,6 @@ pub fn validate_command_for_workspace(
         ));
     }
 
-    let parts =
-        shell_words::split(command).map_err(|_| PolicyError("Invalid command syntax".into()))?;
-    if parts.is_empty() {
-        return Err(PolicyError("Empty command".into()));
-    }
-
     let executable = parts[0].trim_start_matches("./");
     let base_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
     let stem = base_name
@@ -293,7 +295,7 @@ pub fn validate_command_for_workspace(
             .workspace_script_extensions
             .iter()
             .any(|extension| base_name.to_ascii_lowercase().ends_with(extension));
-    if !(policy.allowed_commands.contains(stem)
+    if !(is_allowlisted_program(policy, stem)
         || (policy.workspace_local_entries && workspace_entry_candidate))
     {
         return Err(PolicyError(format!("Command is not allowlisted: {stem}")));
@@ -314,6 +316,15 @@ pub fn validate_command_for_workspace(
     Ok(())
 }
 
+pub(super) fn is_allowlisted_program(policy: &PolicySettings, name: &str) -> bool {
+    let name = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".cmd"))
+        .or_else(|| name.strip_suffix(".bat")).unwrap_or(name);
+    policy.allowed_commands.contains(name) || name.strip_prefix("python3.").is_some_and(|version| {
+        !version.is_empty() && version.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            && policy.allowed_commands.contains("python3")
+    })
+}
+
 fn workspace_local_entry_exists(
     workspace: Option<&Workspace>,
     arguments: &Value,
@@ -327,7 +338,7 @@ fn workspace_local_entry_exists(
         .or_else(|| arguments.get("cwd"))
         .and_then(Value::as_str)
         .unwrap_or(".");
-    let Ok(base) = workspace.resolve_existing(workdir) else {
+    let Ok(base) = resolve_workdir(workspace, workdir) else {
         return false;
     };
     let candidate = if Path::new(executable).is_absolute() {
@@ -435,17 +446,6 @@ fn interpreter_mutation_pattern() -> &'static regex::Regex {
     })
 }
 
-fn command_contains_external_path(command: &str) -> bool {
-    let normalized = command.replace('\\', "/");
-    normalized.contains("../")
-        || normalized.contains("..\\")
-        || regex::Regex::new(r#"(?i)(^|["'\s])/[^"]"#)
-            .expect("valid regex")
-            .is_match(&normalized)
-        || regex::Regex::new(r"(?i)\b[A-Z]:/")
-            .expect("valid regex")
-            .is_match(&normalized)
-}
 
 fn command_targets_protected_repository_asset(command: &str) -> bool {
     let normalized_command = command.to_ascii_lowercase().replace('\\', "/");
