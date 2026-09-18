@@ -364,33 +364,46 @@ impl Workspace {
         include_hidden: bool,
         include_ignored: bool,
     ) -> bool {
-        let Ok(scan_path) = path.strip_prefix(&self.root) else {
-            // Workspace 外的读取路径不套用 Workspace 内部的隐藏/构建目录过滤，
-            // 否则 Windows 临时目录等路径会被误判为隐藏目录而无法读取。
-            return false;
-        };
-        let parts: Vec<String> = scan_path
-            .components()
-            .filter_map(|part| match part {
-                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect();
-        if !include_hidden {
-            for part in &parts {
-                if part.starts_with('.') && part != "." {
-                    return true;
+        match path.strip_prefix(&self.root) {
+            Ok(scan_path) => {
+                let parts: Vec<String> = scan_path
+                    .components()
+                    .filter_map(|part| match part {
+                        Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                if !include_hidden {
+                    for part in &parts {
+                        if part.starts_with('.') && part != "." {
+                            return true;
+                        }
+                    }
                 }
+                if !include_ignored {
+                    for part in &parts {
+                        if DEFAULT_EXCLUDED_NAMES.contains(&part.as_str()) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => {
+                // Workspace 外的显式只读路径：不要用「隐藏目录」规则误伤 Windows
+                // 临时目录，但仍按组件名剪掉 node_modules/target 等体积暴涨目录，
+                // 避免绝对路径 list/search 把整盘扫穿。
+                if include_ignored {
+                    return false;
+                }
+                path.components().any(|part| match part {
+                    Component::Normal(name) => {
+                        DEFAULT_EXCLUDED_NAMES.contains(&name.to_string_lossy().as_ref())
+                    }
+                    _ => false,
+                })
             }
         }
-        if !include_ignored {
-            for part in &parts {
-                if DEFAULT_EXCLUDED_NAMES.contains(&part.as_str()) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     pub fn is_safe_existing_path(&self, path: &Path) -> bool {
