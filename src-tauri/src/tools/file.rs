@@ -12,6 +12,9 @@ use crate::tools::workspace::{relative_display, tool_ok, Workspace, WorkspaceErr
 
 /// Default per-file cap for `search_text` to avoid loading multi-GB assets.
 const DEFAULT_SEARCH_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Hard ceiling on filesystem entries visited by WalkDir, independent of match
+/// count, so ignored-directory misses or sparse globs cannot scan forever.
+const DEFAULT_MAX_VISITED_ENTRIES: usize = 50_000;
 const BINARY_PEEK_BYTES: usize = 8192;
 
 pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
@@ -94,9 +97,10 @@ pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
 }
 
 /// Files above this size take the bounded-memory streaming path: output
-/// semantics are identical to the in-memory path, but peak memory is the
-/// 64 KiB read buffer plus at most `max_bytes` of selected content instead
-/// of two full copies of the file plus a whole-file line index.
+/// content matches the in-memory path up to `max_bytes` / line range, but the
+/// scanner stops once selection is complete so multi-GB files do not thrash
+/// disk. When `scan_complete` is false, `total_lines` / `total_bytes` reflect
+/// the scanned prefix rather than the full file.
 const STREAMING_READ_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
@@ -124,10 +128,12 @@ fn read_file_streaming(
     let mut selected: Vec<u8> = Vec::new();
     let mut line_pending: Vec<u8> = Vec::new();
     let mut overflow = false;
+    let mut hit_eof = false;
 
     loop {
         let read = file.read(&mut buf).map_err(|_| not_found())?;
         if read == 0 {
+            hit_eof = true;
             break;
         }
         let chunk = &buf[..read];
@@ -173,16 +179,31 @@ fn read_file_streaming(
             end_line,
             max_bytes,
         );
+        // Selection is complete: stop scanning the rest of a multi-GB file.
+        // Flush any in-progress line (no trailing newline yet) into selected.
+        if selection_complete(overflow, total_lines, end_line) {
+            if !line_pending.is_empty() {
+                let line_no = total_lines + 1;
+                if line_no >= start_line && end_line.map_or(true, |end| line_no <= end) {
+                    append_capped(&mut selected, &line_pending, max_bytes, &mut overflow);
+                }
+                total_lines = line_no;
+                line_pending.clear();
+            }
+            utf8_carry.clear();
+            break;
+        }
     }
 
     // Incomplete UTF-8 at EOF must match the in-memory path's from_utf8 error.
-    if !utf8_carry.is_empty() {
+    // Early stop mid-file may leave a harmless incomplete carry — discard it.
+    if hit_eof && !utf8_carry.is_empty() {
         return Err(unsupported_encoding());
     }
 
     // Trailing line without a final newline still counts (split_inclusive
-    // semantics) and flushes any buffered selection bytes.
-    if seen > 0 && last_byte != b'\n' {
+    // semantics) and flushes any buffered selection bytes — only at true EOF.
+    if hit_eof && seen > 0 && last_byte != b'\n' {
         let line_no = total_lines + 1;
         if line_no >= start_line && end_line.map_or(true, |end| line_no <= end) {
             append_capped(&mut selected, &line_pending, max_bytes, &mut overflow);
@@ -192,7 +213,7 @@ fn read_file_streaming(
 
     let end = end_line.unwrap_or(total_lines).min(total_lines);
     let truncated = overflow;
-    let (content, truncated_by) = if truncated {
+    let (content, truncated_by) = if overflow {
         let mut cut = selected.len();
         while cut > 0 && std::str::from_utf8(&selected[..cut]).is_err() {
             cut -= 1;
@@ -213,8 +234,11 @@ fn read_file_streaming(
         end
     };
     let mut warnings = Vec::new();
-    if truncated {
+    if overflow {
         warnings.push("content truncated".to_string());
+    }
+    if !hit_eof {
+        warnings.push("file scan stopped early after selection was complete".to_string());
     }
     Ok(tool_ok(json!({
         "path": display,
@@ -227,6 +251,7 @@ fn read_file_streaming(
         "bytes_read": content.len(),
         "truncated": truncated,
         "truncated_by": truncated_by,
+        "scan_complete": hit_eof,
         "warnings": warnings
     })))
 }
@@ -286,6 +311,27 @@ fn append_capped(dst: &mut Vec<u8>, src: &[u8], max_bytes: usize, overflow: &mut
     } else {
         dst.extend_from_slice(src);
     }
+}
+
+fn selection_complete(overflow: bool, total_lines: usize, end_line: Option<usize>) -> bool {
+    if overflow {
+        return true;
+    }
+    end_line.is_some_and(|end| total_lines >= end)
+}
+
+fn walk_allows_entry(
+    ws: &Workspace,
+    walk_root: &Path,
+    entry: &walkdir::DirEntry,
+    include_hidden: bool,
+    include_ignored: bool,
+) -> bool {
+    let path = entry.path();
+    if path == walk_root {
+        return true;
+    }
+    !ws.is_ignored_path(path, include_hidden, include_ignored)
 }
 
 pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
@@ -349,6 +395,11 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .get("max_results")
         .and_then(Value::as_u64)
         .unwrap_or(5000) as usize;
+    let max_visited = args
+        .get("max_visited_entries")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_VISITED_ENTRIES as u64)
+        .max(1) as usize;
     let include_hidden = args
         .get("include_hidden")
         .and_then(Value::as_bool)
@@ -360,22 +411,28 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
 
     let mut files = Vec::new();
     let mut truncated = false;
-    for entry in WalkDir::new(&resolved.path)
+    let mut visit_budget_hit = false;
+    let mut visited = 0usize;
+    let walk_root = resolved.path.clone();
+    for entry in WalkDir::new(&walk_root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| {
+            walk_allows_entry(ws, &walk_root, entry, include_hidden, include_ignored)
+        })
         .filter_map(Result::ok)
     {
+        visited += 1;
+        if visited > max_visited {
+            truncated = true;
+            visit_budget_hit = true;
+            break;
+        }
         let p = entry.path();
-        if p == resolved.path {
+        if p == walk_root.as_path() {
             continue;
         }
         if !ws.is_safe_read_path(p) {
-            continue;
-        }
-        if ws.is_ignored_path(p, include_hidden, include_ignored) {
-            if entry.file_type().is_dir() {
-                continue;
-            }
             continue;
         }
         if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
@@ -401,11 +458,20 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         }
     }
     files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let mut warnings = Vec::new();
+    if truncated {
+        warnings.push(if visit_budget_hit {
+            "visit limit reached; directory walk stopped early".to_string()
+        } else {
+            "result limit reached".to_string()
+        });
+    }
     Ok(tool_ok(json!({
         "path": resolved.display,
         "files": files,
         "truncated": truncated,
-        "warnings": if truncated { vec!["result limit reached"] } else { vec![] }
+        "visited_entries": visited.min(max_visited),
+        "warnings": warnings
     })))
 }
 
@@ -425,6 +491,11 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .get("max_results")
         .and_then(Value::as_u64)
         .unwrap_or(1000) as usize;
+    let max_visited = args
+        .get("max_visited_entries")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_VISITED_ENTRIES as u64)
+        .max(1) as usize;
     let max_preview = args
         .get("max_preview_bytes")
         .and_then(Value::as_u64)
@@ -434,6 +505,10 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_SEARCH_MAX_FILE_BYTES)
         .max(1);
+    let include_ignored = args
+        .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let (include_globs, exclude_globs) = search_globs(args);
     let context_lines = args
@@ -447,6 +522,8 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     let mut skipped_large = 0usize;
     let mut skipped_binary = 0usize;
     let mut truncated = false;
+    let mut visit_budget_hit = false;
+    let mut visited = 0usize;
 
     let mut consider_file = |p: &Path| {
         if matches.len() >= max_results {
@@ -454,9 +531,6 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             return false;
         }
         if !ws.is_safe_read_path(p) {
-            return true;
-        }
-        if ws.is_ignored_path(p, false, false) {
             return true;
         }
         let rel = relative_display(ws.root(), p);
@@ -498,11 +572,21 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     if resolved.path.is_file() {
         let _ = consider_file(&resolved.path);
     } else {
-        for entry in WalkDir::new(&resolved.path)
+        let walk_root = resolved.path.clone();
+        for entry in WalkDir::new(&walk_root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| {
+                walk_allows_entry(ws, &walk_root, entry, false, include_ignored)
+            })
             .filter_map(Result::ok)
         {
+            visited += 1;
+            if visited > max_visited {
+                truncated = true;
+                visit_budget_hit = true;
+                break;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -513,7 +597,11 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     }
 
     if truncated {
-        warnings.push("result limit reached; scan stopped early".to_string());
+        warnings.push(if visit_budget_hit {
+            "visit limit reached; directory walk stopped early".to_string()
+        } else {
+            "result limit reached; scan stopped early".to_string()
+        });
     }
     if skipped_large > 0 {
         warnings.push(format!(
@@ -532,6 +620,7 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         "total_matches": matches.len(),
         "truncated": truncated,
         "max_file_bytes": max_file_bytes,
+        "visited_entries": visited.min(max_visited),
         "skipped_large_files": skipped_large,
         "skipped_binary_files": skipped_binary,
         "warnings": warnings
@@ -939,17 +1028,41 @@ mod streaming_tests {
         std::fs::write(&path, &body).unwrap();
         let streamed = read_file_streaming(&path, "big.txt", max_bytes, start_line, end_line).unwrap();
         let expect = legacy_reference(&body, max_bytes, start_line, end_line);
-        for key in [
-            "content", "start_line", "end_line", "total_lines",
-            "bytes_read", "truncated", "truncated_by",
-        ] {
+        for key in ["content", "start_line", "end_line", "bytes_read", "truncated", "truncated_by"] {
             assert_eq!(
                 streamed.get(key).unwrap(),
                 expect.get(key).unwrap(),
                 "mismatch on {key} (max={max_bytes}, start={start_line}, end={end_line:?})"
             );
         }
-        assert_eq!(streamed.get("total_bytes").unwrap().as_u64().unwrap(), body.len() as u64);
+        let total_bytes = streamed.get("total_bytes").unwrap().as_u64().unwrap();
+        assert!(
+            total_bytes <= body.len() as u64,
+            "scanned more bytes than the file contains"
+        );
+        // Early-stop after selection may leave total_lines below the full-file count.
+        let warnings = streamed
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let early = warnings.iter().any(|w| {
+            w.as_str()
+                .is_some_and(|s| s.contains("stopped early"))
+        });
+        if early {
+            assert!(
+                streamed.get("total_lines").unwrap().as_u64().unwrap()
+                    <= expect.get("total_lines").unwrap().as_u64().unwrap()
+            );
+            assert!(total_bytes < body.len() as u64 || expect["truncated"] == true);
+        } else {
+            assert_eq!(
+                streamed.get("total_lines").unwrap(),
+                expect.get("total_lines").unwrap()
+            );
+            assert_eq!(total_bytes, body.len() as u64);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -967,6 +1080,26 @@ mod streaming_tests {
         compare(body.clone(), 131_072, 200_000, None);
         compare(body.clone(), 131_072, 5, Some(3)); // end < start
         compare("no newline at all".repeat(1000), 64, 1, None); // single giant line
+    }
+
+    #[test]
+    fn streaming_stops_before_eof_once_max_bytes_filled() {
+        let dir = std::env::temp_dir().join(format!("ctm-stream-early-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.txt");
+        // ~8 MiB of lines — well above a 1 KiB content cap.
+        let line = "abcdefghijklmnopqrstuvwxyz\n";
+        let mut body = String::new();
+        while body.len() < 8 * 1024 * 1024 {
+            body.push_str(line);
+        }
+        std::fs::write(&path, &body).unwrap();
+        let streamed = read_file_streaming(&path, "huge.txt", 1024, 1, None).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(streamed["truncated"], true);
+        assert!(streamed["total_bytes"].as_u64().unwrap() < body.len() as u64);
+        let warnings = streamed["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("stopped early")));
     }
 
     fn stream_bytes(bytes: &[u8]) -> Result<Value, WorkspaceError> {
@@ -1005,5 +1138,103 @@ mod streaming_tests {
         let v = read_file_streaming(&path, "f.txt", 70_000, 1, None).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert!(v.get("content").and_then(|c| c.as_str()).unwrap().contains('中'));
+    }
+}
+
+#[cfg(test)]
+mod walk_bound_tests {
+    use super::*;
+    use crate::tools::workspace::Workspace;
+    use serde_json::json;
+    use std::fs;
+
+    fn temp_workspace() -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::new(dir.path().to_path_buf()).expect("workspace");
+        (dir, ws)
+    }
+
+    #[test]
+    fn list_files_prunes_ignored_directories() {
+        let (_dir, ws) = temp_workspace();
+        fs::create_dir_all(ws.root().join("src")).unwrap();
+        fs::write(ws.root().join("src/main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(ws.root().join("node_modules/pkg")).unwrap();
+        // Seed a huge ignored subtree that must not be visited.
+        for i in 0..200 {
+            fs::write(
+                ws.root().join(format!("node_modules/pkg/file-{i}.js")),
+                "ignored",
+            )
+            .unwrap();
+        }
+
+        let out = list_files(
+            &ws,
+            &json!({
+                "path": ".",
+                "patterns": ["**/*"],
+                "max_visited_entries": 50
+            }),
+        )
+        .expect("list_files");
+        let files = out["files"].as_array().unwrap();
+        assert!(files.iter().any(|f| f["path"] == "src/main.rs"));
+        assert!(files
+            .iter()
+            .all(|f| !f["path"].as_str().unwrap().contains("node_modules")));
+        assert!(out["visited_entries"].as_u64().unwrap() < 50);
+    }
+
+    #[test]
+    fn list_files_respects_visit_budget() {
+        let (_dir, ws) = temp_workspace();
+        fs::create_dir_all(ws.root().join("many")).unwrap();
+        for i in 0..40 {
+            fs::write(ws.root().join(format!("many/f-{i}.txt")), "x").unwrap();
+        }
+        let out = list_files(
+            &ws,
+            &json!({
+                "path": ".",
+                "patterns": ["**/*"],
+                "max_results": 1000,
+                "max_visited_entries": 10
+            }),
+        )
+        .expect("list_files");
+        assert_eq!(out["truncated"], true);
+        assert!(out["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("visit limit")));
+    }
+
+    #[test]
+    fn search_text_prunes_ignored_directories() {
+        let (_dir, ws) = temp_workspace();
+        fs::create_dir_all(ws.root().join("src")).unwrap();
+        fs::write(ws.root().join("src/hit.txt"), "needle here").unwrap();
+        fs::create_dir_all(ws.root().join("target/debug")).unwrap();
+        for i in 0..100 {
+            fs::write(
+                ws.root().join(format!("target/debug/obj-{i}.o")),
+                format!("needle in binary noise {i}"),
+            )
+            .unwrap();
+        }
+        let out = search_text(
+            &ws,
+            &json!({
+                "path": ".",
+                "query": "needle",
+                "max_visited_entries": 80
+            }),
+        )
+        .expect("search_text");
+        let matches = out["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0]["path"].as_str().unwrap().contains("src/hit.txt"));
     }
 }
