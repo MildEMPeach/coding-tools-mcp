@@ -12,6 +12,7 @@ use crate::workspace::WorkspaceProfile;
 
 use super::cloudflare::{self, CloudflareTunnelHandle};
 use super::frp::{self, FrpServerConfig};
+use super::openai::{self, OpenAiTunnelHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TunnelServiceKind {
@@ -455,9 +456,52 @@ impl TunnelSupervisor {
             });
         }
 
+        if tunnel_type == "openai" {
+            if kind != TunnelServiceKind::Mcp {
+                self.restore_route_state(&key, previous_route.take(), previous_session.take());
+                return Err(AppError::Message(
+                    "OpenAI Secure MCP Tunnel 仅支持 MCP 服务，不支持 Actions。".into(),
+                ));
+            }
+            let api_key = SecretStore::get(&profile.id, "openai_tunnel_api_key")?
+                .unwrap_or_default();
+            let log_path = log_dir_for_profile(&profile.id).join("openai-tunnel.log");
+            let handle = openai::spawn_openai_tunnel(
+                profile.runtime.local_port,
+                std::path::Path::new(&profile.path),
+                &log_path,
+                &profile.tunnel.openai_tunnel_id,
+                &api_key,
+                profile.tunnel.use_proxy,
+            )
+            .await
+            .inspect_err(|_| {
+                self.restore_route_state(&key, previous_route.take(), previous_session.take());
+            })?;
+
+            let OpenAiTunnelHandle { child, pid } = handle;
+            self.sessions.insert(
+                key,
+                TunnelSession {
+                    // Secure MCP Tunnel is selected by tunnel_id in ChatGPT;
+                    // it intentionally does not expose a public URL.
+                    public_url: String::new(),
+                    pid,
+                    child: Some(child),
+                },
+            );
+            return Ok(TunnelStatus {
+                state: "running".into(),
+                public_url: String::new(),
+                tunnel_pid: pid,
+            });
+        }
+
         if tunnel_type != "cloudflare" {
             self.restore_route_state(&key, previous_route.take(), previous_session.take());
-            return Err(AppError::Message("当前仅支持 FRP 和 Cloudflare。".into()));
+            return Err(AppError::Message(
+                "当前仅支持 FRP、Cloudflare 和 OpenAI Secure MCP Tunnel。".into(),
+            ));
         }
 
         let (port, mode, token, named_url, log_name) = match cloudflare_config(profile, kind) {
@@ -1037,8 +1081,39 @@ fn validate_tunnel_requirements(
         }
         return Ok(());
     }
+    if tunnel_type == "openai" {
+        if kind != TunnelServiceKind::Mcp {
+            return Err(AppError::Message(
+                "OpenAI Secure MCP Tunnel 仅支持 MCP 服务，不支持 Actions。".into(),
+            ));
+        }
+        if profile.auth.oauth_enabled() {
+            return Err(AppError::Message(
+                "当前内置 OAuth 与 OpenAI Secure MCP Tunnel 不兼容：Tunnel 不会公开本机 /oauth/authorize 浏览器授权页。请将 MCP 认证改为“不启用认证”或 Bearer Token 后再启动。"
+                    .into(),
+            ));
+        }
+        openai::resolve_tunnel_client()?;
+        if !openai::valid_tunnel_id(&profile.tunnel.openai_tunnel_id) {
+            return Err(AppError::Message(
+                "OpenAI Tunnel ID 格式无效，应为 tunnel_ 加 32 位小写十六进制字符。".into(),
+            ));
+        }
+        if SecretStore::get(&profile.id, "openai_tunnel_api_key")?
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return Err(AppError::Message(
+                "OpenAI Secure MCP Tunnel 需要填写 Runtime API Key。".into(),
+            ));
+        }
+        return Ok(());
+    }
     if tunnel_type != "cloudflare" {
-        return Err(AppError::Message("当前仅支持 FRP 和 Cloudflare。".into()));
+        return Err(AppError::Message(
+            "当前仅支持 FRP、Cloudflare 和 OpenAI Secure MCP Tunnel。".into(),
+        ));
     }
 
     cloudflare::resolve_cloudflared()?;

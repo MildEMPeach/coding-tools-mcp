@@ -118,6 +118,7 @@ fn well_known_url(base: &str, path: &str) -> String {
 
 pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
     let client = http_client();
+    let openai_tunnel = profile.tunnel.tunnel_type == "openai";
     let mcp_public = profile.effective_public_url();
     let actions_local = profile.actions_local_base_url();
     let actions_public = profile.actions_effective_public_url();
@@ -128,20 +129,66 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
     };
 
     let (mcp_local_ok, mcp_local_detail) = check_url(&client, &profile.local_endpoint()).await;
-    let (mcp_public_ok, mcp_public_detail) =
-        check_mcp_public_url(&client, &profile.public_endpoint()).await;
-    let (mcp_oauth_ok, mcp_oauth_detail) = check_json_field(
-        &client,
-        &well_known_url(&mcp_public, ".well-known/oauth-authorization-server"),
-        "token_endpoint_auth_methods_supported",
-    )
-    .await;
-    let (mcp_protected_ok, mcp_protected_detail) = check_json_field(
-        &client,
-        &well_known_url(&mcp_public, ".well-known/oauth-protected-resource"),
-        "authorization_servers",
-    )
-    .await;
+    let (mcp_public_ok, mcp_public_detail, mcp_oauth_ok, mcp_oauth_detail, mcp_protected_ok, mcp_protected_detail) =
+        if openai_tunnel {
+            let id_ok = crate::tunnel::valid_tunnel_id(&profile.tunnel.openai_tunnel_id);
+            let client_ok = crate::tunnel::resolve_tunnel_client().is_ok();
+            let secret_ok = crate::secret::SecretStore::get(&profile.id, "openai_tunnel_api_key")
+                .ok()
+                .flatten()
+                .is_some_and(|value| !value.trim().is_empty());
+            let embedded_oauth = profile.auth.oauth_enabled();
+            let ready = id_ok && client_ok && secret_ok && !embedded_oauth;
+            (
+                ready,
+                if ready {
+                    format!("Secure MCP Tunnel · {}", profile.tunnel.openai_tunnel_id)
+                } else {
+                    format!(
+                        "Tunnel ID={} · tunnel-client={} · Runtime API Key={} · 内置 OAuth={}",
+                        if id_ok { "OK" } else { "缺失/无效" },
+                        if client_ok { "OK" } else { "未安装" },
+                        if secret_ok { "OK" } else { "未配置" },
+                        if embedded_oauth { "不兼容" } else { "未启用" },
+                    )
+                },
+                !embedded_oauth,
+                if embedded_oauth {
+                    "当前项目的 OAuth 授权页位于本机 /oauth/authorize；OpenAI Tunnel 不会公开该浏览器授权页。请改用“不启用认证”或 Bearer Token。".to_string()
+                } else {
+                    "当前未使用内置 OAuth。Secure MCP Tunnel 会把 MCP 请求转发到本机服务。".to_string()
+                },
+                !embedded_oauth,
+                if embedded_oauth {
+                    "内置 OAuth 需要可从浏览器直接访问的 authorization endpoint。".to_string()
+                } else {
+                    "当前不需要内置 OAuth protected-resource discovery。".to_string()
+                },
+            )
+        } else {
+            let (public_ok, public_detail) =
+                check_mcp_public_url(&client, &profile.public_endpoint()).await;
+            let (oauth_ok, oauth_detail) = check_json_field(
+                &client,
+                &well_known_url(&mcp_public, ".well-known/oauth-authorization-server"),
+                "token_endpoint_auth_methods_supported",
+            )
+            .await;
+            let (protected_ok, protected_detail) = check_json_field(
+                &client,
+                &well_known_url(&mcp_public, ".well-known/oauth-protected-resource"),
+                "authorization_servers",
+            )
+            .await;
+            (
+                public_ok,
+                public_detail,
+                oauth_ok,
+                oauth_detail,
+                protected_ok,
+                protected_detail,
+            )
+        };
 
     let actions_health_url = format!("{actions_local}/health");
     let actions_openapi_local = format!("{actions_local}/openapi.json");
@@ -162,7 +209,7 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
 
     vec![
         health_item("本地 /mcp", mcp_local_ok, mcp_local_detail, "确认 MCP 服务已启动，端口与工作区配置一致。"),
-        health_item("公网 /mcp", mcp_public_ok, mcp_public_detail, "检查隧道是否已连接，或公网 URL 是否填写正确。"),
+        health_item(if openai_tunnel { "OpenAI Secure MCP Tunnel" } else { "公网 /mcp" }, mcp_public_ok, mcp_public_detail, if openai_tunnel { "确认 Tunnel ID、Runtime API Key、tunnel-client 已配置，并关闭当前项目的内置 OAuth。" } else { "检查隧道是否已连接，或公网 URL 是否填写正确。" }),
         health_item("MCP OAuth 授权元数据", mcp_oauth_ok, mcp_oauth_detail, "MCP 认证需设为 OAuth，且公网地址可访问。"),
         health_item("MCP OAuth 受保护资源", mcp_protected_ok, mcp_protected_detail, "确认公网 MCP 根地址与 OAuth 配置一致。"),
         health_item("本地 Actions /health", actions_local_ok, actions_local_detail, "确认 Actions 服务已启动。"),

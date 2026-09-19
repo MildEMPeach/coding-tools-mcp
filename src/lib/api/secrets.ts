@@ -12,6 +12,7 @@ export type WorkspaceSecretKey =
   | "actions_oauth_password"
   | "actions_oauth_token_secret"
   | "actions_frp_token"
+  | "openai_tunnel_api_key"
   | "frp_token";
 
 export async function getWorkspaceSecret(

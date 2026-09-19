@@ -70,6 +70,17 @@ macOS 安装包目前未签名。如果系统阻止首次打开，请在“系�
 - 在“FRP 配置”中保存服务器、端口和 Token，或在工作区选择 Cloudflare。
 - 每个工作区填写独立子域名。应用会统一管理 FRP 进程和多条代理线路。
 
+如果只需要让支持 Secure MCP Tunnel 的 OpenAI 产品访问本地 MCP，也可以在 MCP 的“隧道类型”中选择 **OpenAI Secure MCP Tunnel**。这种模式不暴露公网 URL，而是由本机 `tunnel-client` 主动连接 OpenAI：
+
+1. 在“软件管理”安装 `OpenAI Secure MCP Tunnel (tunnel-client)`；
+2. 在 OpenAI Platform 的 Tunnels 管理页创建或取得 `tunnel_id`；
+3. 创建具有 Tunnels Read + Use 权限的 Runtime API Key；
+4. 在工作区 MCP 隧道配置中填写 Tunnel ID 和 Runtime API Key；
+5. 启动 MCP 后，桌面端会自动运行 `tunnel-client` 并将本地 `/mcp` 转发到该 Tunnel；
+6. 在 ChatGPT 创建开发者模式插件时，将连接方式选择为 **Tunnel**，选择或粘贴对应的 Tunnel ID。
+
+OpenAI Secure MCP Tunnel 当前仅用于 MCP，不用于 GPT Actions；它也不会生成“公网 MCP 地址”。另外，本项目自带的 OAuth Authorization Server 也只监听本机，而 Secure MCP Tunnel 不会公开浏览器需要访问的 `/oauth/authorize`，因此该模式下请把 MCP 认证改为“不启用认证”或 Bearer Token；不要使用当前内置 OAuth。
+
 ![FRP 配置页面](docs/images/frp-configuration.png)
 
 *FRP 服务器配置集中保存，各工作区只需选择配置并填写自己的子域名。*

@@ -1,4 +1,4 @@
-//! Software management for the two tunnel binaries: frpc and cloudflared.
+//! Software management for tunnel binaries: frpc, cloudflared and OpenAI tunnel-client.
 //!
 //! Both can be installed into the app cache `bin/` directory (downloaded from
 //! GitHub, honoring the mirror + proxy config). Binaries found in the cache dir
@@ -14,6 +14,9 @@ use crate::platform::platform;
 use crate::tunnel::cloudflare::{cached_cloudflared_path, download_cloudflared_to_cache};
 use crate::tunnel::frp::{cached_frpc_path, download_frpc_to_cache, resolve_frpc};
 use crate::tunnel::cloudflare::resolve_cloudflared;
+use crate::tunnel::openai::{
+    cached_tunnel_client_path, download_tunnel_client_to_cache, resolve_tunnel_client,
+};
 
 /// Status of a managed tunnel binary, serialized to the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +32,23 @@ pub struct SoftwareStatus {
     pub path: String,
     /// True when the resolved binary lives in the app cache dir (uninstallable).
     pub managed: bool,
+}
+
+fn openai_tunnel_status() -> SoftwareStatus {
+    let cache = cached_tunnel_client_path().filter(|p| p.is_file());
+    let resolved = resolve_tunnel_client().ok();
+    let (path, managed, installed) = match (&cache, &resolved) {
+        (Some(cache_path), _) => (cache_path.clone(), true, true),
+        (None, Some(found)) => (found.clone(), false, true),
+        (None, None) => (PathBuf::new(), false, false),
+    };
+    SoftwareStatus {
+        kind: "openai-tunnel".into(),
+        name: "OpenAI Secure MCP Tunnel (tunnel-client)".into(),
+        installed,
+        path: path.to_string_lossy().to_string(),
+        managed,
+    }
 }
 
 fn frpc_status() -> SoftwareStatus {
@@ -68,7 +88,7 @@ fn cloudflared_status() -> SoftwareStatus {
 
 /// Report install status for both binaries.
 pub fn list_software() -> Vec<SoftwareStatus> {
-    vec![frpc_status(), cloudflared_status()]
+    vec![frpc_status(), cloudflared_status(), openai_tunnel_status()]
 }
 
 /// Install (download into cache) the requested binary.
@@ -82,6 +102,10 @@ pub async fn install_software(kind: &str) -> AppResult<SoftwareStatus> {
             download_cloudflared_to_cache().await?;
             Ok(cloudflared_status())
         }
+        "openai-tunnel" => {
+            download_tunnel_client_to_cache().await?;
+            Ok(openai_tunnel_status())
+        }
         other => Err(AppError::Message(format!("未知软件: {other}"))),
     }
 }
@@ -92,6 +116,7 @@ pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
     let cache_path = match kind {
         "frpc" => cached_frpc_path(),
         "cloudflared" => cached_cloudflared_path(),
+        "openai-tunnel" => cached_tunnel_client_path(),
         other => return Err(AppError::Message(format!("未知软件: {other}"))),
     };
 
@@ -117,6 +142,7 @@ pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
 
     Ok(match kind {
         "frpc" => frpc_status(),
-        _ => cloudflared_status(),
+        "cloudflared" => cloudflared_status(),
+        _ => openai_tunnel_status(),
     })
 }

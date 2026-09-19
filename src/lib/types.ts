@@ -12,6 +12,7 @@ export interface TunnelConfig {
   frp_server_port?: number;
   cloudflare_mode: string;
   cloudflare_http2?: boolean;
+  openai_tunnel_id?: string;
   frp_tls?: boolean;
   use_proxy?: boolean;
 }

@@ -14,6 +14,7 @@
     frp_server_port: number;
     cloudflare_mode: string;
     cloudflare_http2: boolean;
+    openai_tunnel_id: string;
     frp_tls: boolean;
     use_proxy: boolean;
   }
@@ -41,6 +42,7 @@
     frp_server_port: 7000,
     cloudflare_mode: "quick",
     cloudflare_http2: true,
+    openai_tunnel_id: "",
     frp_tls: false,
     use_proxy: true,
   });
@@ -52,13 +54,15 @@
   let legacyFrpOpen = $state(false);
 
   const secretKey = $derived(
-    service === "mcp"
-      ? draft.type === "frp"
-        ? ("frp_token" as const)
-        : ("cloudflare_token" as const)
-      : draft.type === "frp"
-        ? ("actions_frp_token" as const)
-        : ("actions_cloudflare_token" as const),
+    draft.type === "openai"
+      ? ("openai_tunnel_api_key" as const)
+      : service === "mcp"
+        ? draft.type === "frp"
+          ? ("frp_token" as const)
+          : ("cloudflare_token" as const)
+        : draft.type === "frp"
+          ? ("actions_frp_token" as const)
+          : ("actions_cloudflare_token" as const),
   );
 
   const selectedProfile = $derived(
@@ -76,6 +80,7 @@
       draft.frp_server_port !== config.frp_server_port ||
       draft.cloudflare_mode !== config.cloudflare_mode ||
       draft.cloudflare_http2 !== config.cloudflare_http2 ||
+      draft.openai_tunnel_id !== config.openai_tunnel_id ||
       draft.frp_tls !== config.frp_tls ||
       draft.use_proxy !== config.use_proxy ||
       tokenPending,
@@ -83,15 +88,19 @@
 
   const showFrp = $derived(draft.type === "frp");
   const showCloudflare = $derived(draft.type === "cloudflare");
+  const showOpenAi = $derived(service === "mcp" && draft.type === "openai");
   const showCloudflareToken = $derived(showCloudflare && draft.cloudflare_mode === "named");
   const showLegacyFrpToken = $derived(showFrp && !useGlobalProfile);
-  const canTest = $derived(draft.type === "frp" || draft.type === "cloudflare");
+  const canTest = $derived(
+    draft.type === "frp" || draft.type === "cloudflare" || showOpenAi,
+  );
 
   $effect(() => {
     draft = {
       ...config,
       frp_profile_id: config.frp_profile_id ?? "",
       cloudflare_http2: config.cloudflare_http2 ?? true,
+      openai_tunnel_id: config.openai_tunnel_id ?? "",
       frp_tls: config.frp_tls ?? false,
       use_proxy: config.use_proxy ?? true,
     };
@@ -102,7 +111,7 @@
   });
 
   async function saveDraft(options?: SaveTunnelOptions) {
-    if (tokenField && (showLegacyFrpToken || showCloudflareToken)) {
+    if (tokenField && (showLegacyFrpToken || showCloudflareToken || showOpenAi)) {
       await tokenField.saveIfDirty();
     }
     const payload: TunnelFormConfig = {
@@ -180,6 +189,9 @@
       <option value="none">未配置</option>
       <option value="frp">FRP</option>
       <option value="cloudflare">Cloudflare</option>
+      {#if service === "mcp"}
+        <option value="openai">OpenAI Secure MCP Tunnel</option>
+      {/if}
     </select>
   </label>
 
@@ -346,20 +358,57 @@
     </label>
   {/if}
 
-  <label class="grid gap-1">
-    <span class="text-xs text-[var(--color-text-muted)]">
-      公网 URL
-      {#if service === "actions"}
-        <span class="text-[var(--color-text-muted)]">（OpenAPI 根地址）</span>
-      {/if}
-    </span>
-    <input
-      type="url"
-      class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
-      placeholder="https://..."
-      bind:value={draft.public_url}
+  {#if showOpenAi}
+    <div class="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2.5 text-xs text-[var(--color-text-muted)]">
+      OpenAI Secure MCP Tunnel 使用仅出站连接，不会生成公网 URL。请先在 OpenAI Platform 创建 Tunnel，
+      然后在 ChatGPT 创建开发者模式插件时将连接方式选择为 Tunnel，并选择或粘贴下面的 Tunnel ID。
+    </div>
+    <div class="rounded-md border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 px-3 py-2.5 text-xs text-[var(--color-text-secondary)]">
+      注意：本项目内置 OAuth 的浏览器授权页只监听本机，OpenAI Tunnel 不会把该授权页公开出去。
+      使用此模式前请把下方 MCP「认证类型」改为“不启用认证”或 Bearer Token。
+    </div>
+
+    <label class="grid gap-1">
+      <span class="text-xs text-[var(--color-text-muted)]">OpenAI Tunnel ID</span>
+      <input
+        type="text"
+        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
+        placeholder="tunnel_0123456789abcdef0123456789abcdef"
+        bind:value={draft.openai_tunnel_id}
+      />
+      <p class="text-[11px] text-[var(--color-text-muted)]">
+        格式为 tunnel_ 加 32 位小写十六进制字符。
+      </p>
+    </label>
+
+    <SecretTokenField
+      bind:this={tokenField}
+      bind:hasPending={tokenPending}
+      {workspaceId}
+      secretKey={secretKey}
+      label="OpenAI Runtime API Key"
     />
-  </label>
+    <p class="-mt-2 text-[11px] text-[var(--color-text-muted)]">
+      使用 Tunnel Runtime API Key（CONTROL_PLANE_API_KEY），不要填写用于 Tunnel CRUD 的 Admin Key。
+    </p>
+  {/if}
+
+  {#if !showOpenAi}
+    <label class="grid gap-1">
+      <span class="text-xs text-[var(--color-text-muted)]">
+        公网 URL
+        {#if service === "actions"}
+          <span class="text-[var(--color-text-muted)]">（OpenAPI 根地址）</span>
+        {/if}
+      </span>
+      <input
+        type="url"
+        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
+        placeholder="https://..."
+        bind:value={draft.public_url}
+      />
+    </label>
+  {/if}
 
   <div class="flex justify-end gap-2 pt-1">
     {#if canTest}

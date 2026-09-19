@@ -35,6 +35,9 @@ pub struct TunnelConfig {
     /// When true, start cloudflared with `--protocol http2` instead of default QUIC.
     #[serde(default = "default_cloudflare_http2")]
     pub cloudflare_http2: bool,
+    /// OpenAI Secure MCP Tunnel identifier. Only used when `tunnel_type == "openai"`.
+    #[serde(default)]
+    pub openai_tunnel_id: String,
     /// Legacy manual FRP: enable transport TLS in generated frpc.toml.
     /// Ignored when `frp_profile_id` resolves to a global profile (profile.tls_enable wins).
     #[serde(default)]
@@ -262,6 +265,7 @@ impl Default for TunnelConfig {
             frp_server_port: default_frp_server_port(),
             cloudflare_mode: default_cloudflare_mode(),
             cloudflare_http2: default_cloudflare_http2(),
+            openai_tunnel_id: String::new(),
             frp_tls: false,
             use_proxy: default_use_proxy(),
         }
@@ -643,6 +647,9 @@ fn computed_public_url(
     frp_profile_id: &str,
     settings: &AppSettings,
 ) -> String {
+    if tunnel_type == "openai" {
+        return String::new();
+    }
     if tunnel_type == "frp" {
         let server = settings
             .find_frp_profile(frp_profile_id)

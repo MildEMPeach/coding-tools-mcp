@@ -116,11 +116,22 @@
 
   <div class="grid gap-3">
     {#if service === "mcp"}
-      <CopyFieldRow
-        label="公网 MCP 地址"
-        value={publicMcpEndpoint}
-        hint="GPT 连接器里填这个 URL"
-      />
+      {#if profile.tunnel.type === "openai"}
+        <CopyFieldRow
+          label="OpenAI Tunnel ID"
+          value={profile.tunnel.openai_tunnel_id ?? ""}
+          hint="ChatGPT 创建开发者模式插件时，连接方式选择 Tunnel，然后选择或粘贴此 ID"
+        />
+        <p class="text-xs text-[var(--color-text-muted)]">
+          Secure MCP Tunnel 不需要公网 MCP URL；保持桌面端 MCP 服务运行即可。
+        </p>
+      {:else}
+        <CopyFieldRow
+          label="公网 MCP 地址"
+          value={publicMcpEndpoint}
+          hint="GPT 连接器里填这个 URL"
+        />
+      {/if}
       {#if auth.type === "oauth"}
         <CopyFieldRow label="OAuth Client ID" value={secrets.oauth_client_id ?? auth.oauth_client_id} {loading} />
         <CopyFieldRow

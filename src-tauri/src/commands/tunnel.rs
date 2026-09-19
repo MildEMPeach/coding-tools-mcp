@@ -108,6 +108,7 @@ fn mcp_tunnel_matches(
         && left.tunnel.frp_server_port == right.tunnel.frp_server_port
         && left.tunnel.cloudflare_mode == right.tunnel.cloudflare_mode
         && left.tunnel.cloudflare_http2 == right.tunnel.cloudflare_http2
+        && left.tunnel.openai_tunnel_id == right.tunnel.openai_tunnel_id
         && left.tunnel.frp_tls == right.tunnel.frp_tls
         && left.tunnel.use_proxy == right.tunnel.use_proxy
 }
@@ -339,8 +340,11 @@ pub async fn test_tunnel(
         guard.stop(&profile, kind, &settings).await?;
     }
 
-    let success = !public_url.is_empty();
-    let message = if public_url.is_empty() {
+    let is_openai = tunnel_type_for(&profile, kind) == "openai";
+    let success = !public_url.is_empty() || (is_openai && status.state == "running");
+    let message = if is_openai && success {
+        "OpenAI Secure MCP Tunnel 配置验证通过。本地服务未运行，测试进程已自动断开。".into()
+    } else if public_url.is_empty() {
         "隧道进程已退出，未获取到公网地址。".into()
     } else {
         "隧道配置验证通过。本地服务未运行，测试连接已自动断开。".into()

@@ -16,6 +16,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "actions_oauth_token_secret",
     "frp_token",
     "actions_frp_token",
+    "openai_tunnel_api_key",
 ];
 
 fn ensure_workspace_exists(state: &AppState, id: &str) -> AppResult<()> {

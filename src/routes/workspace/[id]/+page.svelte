@@ -97,6 +97,7 @@
     frp_server_port: profile?.tunnel.frp_server_port ?? 7000,
     cloudflare_mode: profile?.tunnel.cloudflare_mode ?? "quick",
     cloudflare_http2: profile?.tunnel.cloudflare_http2 ?? true,
+    openai_tunnel_id: profile?.tunnel.openai_tunnel_id ?? "",
     frp_tls: profile?.tunnel.frp_tls ?? false,
     use_proxy: profile?.tunnel.use_proxy ?? true,
   });
@@ -110,6 +111,7 @@
     frp_server_port: actions?.frp_server_port ?? 7000,
     cloudflare_mode: actions?.cloudflare_mode ?? "quick",
     cloudflare_http2: actions?.cloudflare_http2 ?? true,
+    openai_tunnel_id: "",
     frp_tls: actions?.frp_tls ?? false,
     use_proxy: actions?.use_proxy ?? true,
   });
@@ -197,7 +199,7 @@
   }
 
   function tunnelConfigured(type: string | undefined): boolean {
-    return type === "cloudflare" || type === "frp";
+    return type === "cloudflare" || type === "frp" || type === "openai";
   }
 
   async function afterServiceStart(
@@ -213,7 +215,12 @@
         : nextProfile
           ? actionsConfig(nextProfile).tunnel_type
           : undefined;
-    if (runtime.state === "running" && tunnelConfigured(tunnelType) && !runtime.publicEndpoint) {
+    if (
+      runtime.state === "running" &&
+      tunnelConfigured(tunnelType) &&
+      tunnelType !== "openai" &&
+      !runtime.publicEndpoint
+    ) {
       showToast(
         "本地服务已启动，但隧道未能自动连接。请检查代理设置与隧道配置，或查看日志。",
         { title: "隧道未连接", kind: "warning", duration: 8000 },
@@ -345,13 +352,14 @@
       tunnel: {
         ...profile.tunnel,
         type: config.type,
-        public_url: config.public_url,
+        public_url: config.type === "openai" ? "" : config.public_url,
         frp_server: config.frp_server,
         frp_subdomain: config.frp_subdomain,
         frp_profile_id: config.frp_profile_id,
         frp_server_port: config.frp_server_port,
         cloudflare_mode: config.cloudflare_mode,
         cloudflare_http2: config.cloudflare_http2,
+        openai_tunnel_id: config.openai_tunnel_id,
         frp_tls: config.frp_tls,
         use_proxy: config.use_proxy,
       },
@@ -362,7 +370,7 @@
     }
     if (workspaceId !== targetWorkspaceId) return;
     profile = next;
-    mcpPublic = publicEndpointFromTunnel(config, "/mcp");
+    mcpPublic = config.type === "openai" ? "" : publicEndpointFromTunnel(config, "/mcp");
     if (!options?.skipTunnelRestart && !options?.skipServicePrompt) {
       await load();
       if (workspaceId !== targetWorkspaceId) return;
@@ -624,8 +632,8 @@
             busy={mcpBusy}
             tunnelType={profile.tunnel.type}
             localEndpoint={mcpLocal || mcpLocalEndpoint(profile.runtime.local_port)}
-            publicEndpoint={mcpPublic}
-            publicLabel="公网 MCP"
+            publicEndpoint={profile.tunnel.type === "openai" ? (profile.tunnel.openai_tunnel_id ?? "") : mcpPublic}
+            publicLabel={profile.tunnel.type === "openai" ? "OpenAI Tunnel ID" : "公网 MCP"}
             onToggle={toggleMcp}
             onPortChange={saveMcpPort}
           />

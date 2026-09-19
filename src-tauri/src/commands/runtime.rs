@@ -164,6 +164,18 @@ async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatu
         Ok(None) => {}
         Err(error) => {
             eprintln!("mcp tunnel auto-start failed for {id}: {error}");
+            if profile.tunnel.tunnel_type == "openai" {
+                // OpenAI Secure MCP Tunnel has no public URL, so the frontend
+                // cannot infer a failed tunnel from an empty public endpoint as
+                // it does for FRP/Cloudflare. Fail closed and tear the local
+                // listener back down so the service card surfaces the real error.
+                let _ = stop_mcp_service(state, id).await;
+                return mcp_start_failure(
+                    state,
+                    &profile,
+                    format!("OpenAI Secure MCP Tunnel 启动失败：{error}"),
+                );
+            }
         }
     }
 

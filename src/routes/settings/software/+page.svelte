@@ -75,7 +75,7 @@
     <p class="page-kicker">全局设置</p>
     <h2 class="page-title">软件管理</h2>
     <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
-      在此安装或卸载 frpc 和 cloudflared 隧道客户端。安装的软件会放入应用缓存目录，可统一管理。
+      在此安装或卸载 frpc、cloudflared 和 OpenAI tunnel-client。安装的软件会放入应用缓存目录，可统一管理。
     </p>
   </header>
 

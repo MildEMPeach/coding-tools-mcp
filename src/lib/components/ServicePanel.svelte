@@ -44,9 +44,17 @@
   const running = $derived(status === "running");
   const showError = $derived(status === "error" && Boolean(statusMessage));
   const canEditPort = $derived(portEditable && !running && status !== "starting");
-  const tunnelEnabled = $derived(tunnelType === "cloudflare" || tunnelType === "frp");
+  const tunnelEnabled = $derived(
+    tunnelType === "cloudflare" || tunnelType === "frp" || tunnelType === "openai",
+  );
   const tunnelLabel = $derived(
-    tunnelType === "cloudflare" ? "Cloudflare" : tunnelType === "frp" ? "FRP" : "",
+    tunnelType === "cloudflare"
+      ? "Cloudflare"
+      : tunnelType === "frp"
+        ? "FRP"
+        : tunnelType === "openai"
+          ? "OpenAI Secure MCP"
+          : "",
   );
 
   async function commitPort() {

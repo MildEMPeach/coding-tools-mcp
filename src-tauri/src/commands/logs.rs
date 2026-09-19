@@ -39,6 +39,9 @@ fn log_file_names(profile: &WorkspaceProfile, service: &str) -> AppResult<Vec<&'
             if profile.tunnel.tunnel_type == "frp" {
                 names.insert(0, "frpc-mcp.log");
             }
+            if profile.tunnel.tunnel_type == "openai" {
+                names.insert(0, "openai-tunnel.log");
+            }
             Ok(names)
         }
         "actions" => {
