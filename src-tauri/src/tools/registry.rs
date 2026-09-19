@@ -2,6 +2,78 @@ use serde_json::{json, Value};
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
+        "goal_status",
+        "Goal status",
+        "Return the current long-running Goal, monitor health, progress, and whether the agent should keep working.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "goal_handoff",
+        "Continue goal in ChatGPT",
+        "Use only as the final Goal tool call when an active Goal is still incomplete. Render a Goal UI that can request a ChatGPT follow-up message to continue the same Goal.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_create",
+        "Create goal",
+        "Create a persistent long-running Goal and attach it to the current Harness Task, starting a Task when necessary.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_update",
+        "Update goal",
+        "Update Goal progress, checklist, and monitoring heartbeat while work continues.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_pause",
+        "Pause goal",
+        "Pause automatic Goal continuation while preserving progress.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_resume",
+        "Resume goal",
+        "Resume a paused or blocked long-running Goal.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_block",
+        "Block goal",
+        "Mark a Goal blocked with a concrete reason when user input or an external dependency is required.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_complete",
+        "Complete goal",
+        "Complete a Goal only after verification passes, or explicitly mark it unverified when verification cannot run.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_clear",
+        "Clear goal",
+        "Stop monitoring and clear the current Goal while retaining its durable history.",
+        false,
+        false,
+        false,
+    ),
+    (
         "harness_status",
         "Harness status",
         "Return durable task, workspace, capability, and recovery status.",
@@ -317,6 +389,15 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
 
 /// old Python 版本默认提供的核心工具集。默认 MCP 只暴露这一组，保持 Agent 的工具面稳定。
 pub const CORE_TOOLS: &[&str] = &[
+    "goal_status",
+    "goal_handoff",
+    "goal_create",
+    "goal_update",
+    "goal_pause",
+    "goal_resume",
+    "goal_block",
+    "goal_complete",
+    "goal_clear",
     "harness_status",
     "operation_log",
     "server_info",
@@ -358,6 +439,7 @@ pub const CORE_TOOLS: &[&str] = &[
 ];
 
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
+    "goal_status",
     "harness_status",
     "operation_log",
     "server_info",
@@ -385,6 +467,15 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 pub const ALLOWED_TOOLS: &[&str] = &[
+    "goal_status",
+    "goal_handoff",
+    "goal_create",
+    "goal_update",
+    "goal_pause",
+    "goal_resume",
+    "goal_block",
+    "goal_complete",
+    "goal_clear",
     "harness_status",
     "operation_log",
     "server_info",
@@ -428,6 +519,14 @@ pub const ALLOWED_TOOLS: &[&str] = &[
 ];
 
 pub const MUTATING_TOOLS: &[&str] = &[
+    "goal_handoff",
+    "goal_create",
+    "goal_update",
+    "goal_pause",
+    "goal_resume",
+    "goal_block",
+    "goal_complete",
+    "goal_clear",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -444,6 +543,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
 ];
 
 pub const READ_ONLY_TOOLS: &[&str] = &[
+    "goal_status",
     "harness_status",
     "operation_log",
     "server_info",
@@ -517,7 +617,7 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                 } else {
                     (read_only, destructive, open_world)
                 };
-                json!({
+                let mut descriptor = json!({
                     "name": name,
                     "title": title,
                     "description": description,
@@ -529,7 +629,16 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                         "idempotentHint": read_only,
                         "openWorldHint": open_world
                     }
-                })
+                });
+                if name == "goal_handoff" {
+                    descriptor["_meta"] = json!({
+                        "ui": {
+                            "resourceUri": crate::monitor::GOAL_WIDGET_URI
+                        },
+                        "openai/outputTemplate": crate::monitor::GOAL_WIDGET_URI
+                    });
+                }
+                descriptor
             })
         })
         .collect()
@@ -602,6 +711,67 @@ pub fn input_schema(name: &str) -> Value {
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                 "max_bytes": { "type": "integer", "minimum": 1, "maximum": 65536, "default": 32768 },
                 "expected_hash": { "type": "string", "minLength": 64, "maxLength": 64 }
+            },
+            "additionalProperties": false
+        }),
+        "goal_status" => json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+        }),
+        "goal_handoff" => json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+        }),
+        "goal_create" => json!({
+            "type": "object",
+            "properties": {
+                "objective": { "type": "string", "minLength": 1 },
+                "auto_continue": { "type": "boolean", "default": true },
+                "stale_after_secs": { "type": "integer", "minimum": 30, "maximum": 86400, "default": 180 },
+                "completed_steps": { "type": "array", "items": { "type": "string" } },
+                "pending_steps": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["objective"],
+            "additionalProperties": false
+        }),
+        "goal_update" => json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string", "minLength": 1 },
+                "completed_steps": { "type": "array", "items": { "type": "string" } },
+                "pending_steps": { "type": "array", "items": { "type": "string" } },
+                "note": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "goal_pause" | "goal_resume" | "goal_clear" => json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+        }),
+        "goal_block" => json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string", "minLength": 1 },
+                "reason": { "type": "string", "minLength": 1 }
+            },
+            "required": ["reason"],
+            "additionalProperties": false
+        }),
+        "goal_complete" => json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string", "minLength": 1 },
+                "verified": { "type": "boolean", "default": false },
+                "allow_unverified": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
         }),
@@ -943,7 +1113,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile};
 
     #[test]
-    fn core_catalog_exposes_26_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_47_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -951,7 +1121,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 47);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
@@ -959,6 +1129,15 @@ mod tests {
         assert!(names.contains(&"history_session_search"));
         assert!(names.contains(&"history_session_read"));
         assert!(names.contains(&"grep_text"));
+        assert!(names.contains(&"goal_status"));
+        assert!(names.contains(&"goal_handoff"));
+        assert!(names.contains(&"goal_create"));
+        assert!(names.contains(&"goal_update"));
+        assert!(names.contains(&"goal_pause"));
+        assert!(names.contains(&"goal_resume"));
+        assert!(names.contains(&"goal_block"));
+        assert!(names.contains(&"goal_complete"));
+        assert!(names.contains(&"goal_clear"));
         assert!(!names.contains(&"grep"));
 
         for name in names {

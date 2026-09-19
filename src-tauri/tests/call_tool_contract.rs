@@ -208,7 +208,7 @@ fn core_profile_exposes_history_and_harness_workflows() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 38);
+    assert_eq!(names.len(), 47);
     assert!(names.contains("grep_text"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
@@ -224,6 +224,15 @@ fn core_profile_exposes_history_and_harness_workflows() {
     assert!(names.contains("task_context"));
     assert!(names.contains("change_summary"));
     assert!(names.contains("patch_check"));
+    assert!(names.contains("goal_status"));
+    assert!(names.contains("goal_handoff"));
+    assert!(names.contains("goal_create"));
+    assert!(names.contains("goal_update"));
+    assert!(names.contains("goal_pause"));
+    assert!(names.contains("goal_resume"));
+    assert!(names.contains("goal_block"));
+    assert!(names.contains("goal_complete"));
+    assert!(names.contains("goal_clear"));
 }
 
 #[test]

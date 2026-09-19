@@ -130,31 +130,26 @@ fn venv_entry_keeps_its_environment_and_versioned_python_is_allowed() {
     let bin = dir.path().join("venv/bin");
     std::fs::create_dir_all(&base).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
-    let python = which::which(PYTHON).unwrap();
+
+    // Reproduce the important venv property without depending on a real
+    // Python installation. The executable reports the path it was invoked
+    // through. If exec path resolution incorrectly canonicalizes the venv
+    // symlink, this prints base/python3.13 instead of venv/bin/python.
     let versioned = base.join("python3.13");
-    symlink(python, &versioned).unwrap();
-    // A minimal pyvenv.cfg is sufficient to observe the invocation identity.
-    std::fs::write(
-        dir.path().join("venv/pyvenv.cfg"),
-        "include-system-site-packages = false\n",
-    )
-    .unwrap();
+    std::fs::write(&versioned, "#!/bin/sh\nprintf '%s\\n' \"$0\"\n").unwrap();
+    std::fs::set_permissions(&versioned, std::fs::Permissions::from_mode(0o755)).unwrap();
     symlink(&versioned, bin.join("python")).unwrap();
     let ctx = common::ctx_for(dir.path());
     let out = run(
         &ctx,
-        format!(
-            "\"{}\" -c \"import sys; print(sys.prefix)\"",
-            bin.join("python").display()
-        ),
+        format!("\"{}\"", bin.join("python").display()),
         dir.path(),
     );
     assert_eq!(out["command_ok"], true, "{out}");
+    let expected_entry = bin.canonicalize().unwrap().join("python");
     assert_eq!(
-        Path::new(out["stdout"].as_str().unwrap().trim())
-            .canonicalize()
-            .unwrap(),
-        dir.path().join("venv").canonicalize().unwrap()
+        Path::new(out["stdout"].as_str().unwrap().trim()),
+        expected_entry
     );
     // A native entry containing a version-like extension must not be mistaken for a script.
     let versioned_entry = dir.path().join("python3.99");

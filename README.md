@@ -241,6 +241,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 - **多工作区管理**：一个桌面客户端可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
 - **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
 - **Harness 默认可用**：核心工具档位直接提供任务状态、操作记录、项目状态和变更摘要；简单操作仍可保持 standalone，不强制创建 Task。
+- **Goal Monitor**：长期目标可绑定 Harness Task，后台持续判断 running / idle / stalled / blocked 状态，并在桌面端跨工作区统一管理。
 
 ## 让项目记住每次对话
 
@@ -285,6 +286,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 | 环境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
 | 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate`、`history_session_search`、`history_session_read` |
 | Harness | `harness_status`、`operation_log`、`project_state`、`start_task`、`update_task`、`finish_task`、`task_context`、`change_summary`、`patch_check` |
+| Goal Monitor | `goal_create`、`goal_status`、`goal_handoff`、`goal_update`、`goal_pause`、`goal_resume`、`goal_block`、`goal_complete`、`goal_clear` |
 
 典型开发过程：
 
@@ -303,6 +305,37 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 ```
 
 `core` 是默认推荐档位；`advanced` 会进一步暴露全部诊断工具。Harness 采用 Workspace-first 模型，因此普通文件修改和命令执行不要求先创建 Task，只有需要多步推进、跨轮次恢复或更完整审计时才建议进入 Task 模式。
+
+### 长期 Goal 与自动监控
+
+当任务需要“持续推进直到满足条件”时，可以创建 Goal。Goal 会自动绑定当前 Harness Task（没有 Task 时会创建一个），并独立保存长期目标、completed/pending steps、最近活动时间、停滞阈值和监控健康状态。
+
+```text
+goal_create
+  → Goal active + Harness Task
+  → Agent 修改 / 执行 / 验证
+  → goal_update 更新 checklist
+  → 后台 Monitor 每 15 秒检查活动状态
+  → running / idle / stalled / blocked
+  → goal_complete(verified=true)
+```
+
+桌面端侧边栏的“目标监控”可以跨 Workspace 查看所有 Goal，并创建、暂停、恢复或清除目标。`stalled` 只表示 Monitor 检测到长时间无进展，不会擅自把 Goal 改成失败或终止状态。
+
+`goal_status` 只负责返回当前状态；`goal_handoff` 专门负责最后一轮交接，并关联一个 MCP Apps Goal 控件。当 Goal 仍为 active / `should_continue=true` 时，控件会通过 MCP Apps 的 follow-up message 能力请求 ChatGPT 网页端继续下一轮。模型能力始终来自当前 ChatGPT 会话，本项目本身不会调用 OpenAI 模型 API，也不需要额外配置 API Key。
+
+```text
+ChatGPT 当前回合
+  → goal_status / task_context
+  → 修改 / 测试 / goal_update
+  → 仍未完成
+  → goal_handoff
+  → ChatGPT Goal UI 请求 follow-up message
+  → 网页端 GPT 开始下一轮
+  → 继续使用同一 MCP / Goal / Harness
+```
+
+如果宿主不支持 MCP Apps follow-up bridge，Goal 控件会退化为“继续 Goal”按钮，Goal 状态本身仍会正常持久化。
 
 ## 权限与恢复模型
 

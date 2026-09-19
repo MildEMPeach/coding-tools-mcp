@@ -5,6 +5,7 @@ mod frp_profiles;
 mod health;
 mod harness;
 mod logs;
+mod monitor;
 pub(crate) mod runtime;
 mod secrets;
 mod software;
@@ -28,6 +29,10 @@ pub use frp_profiles::{
 pub use health::run_health_checks;
 pub use harness::get_harness_dashboard;
 pub use logs::read_workspace_logs;
+pub use monitor::{
+    clear_workspace_goal, create_workspace_goal, list_goal_dashboard, pause_workspace_goal,
+    resume_workspace_goal,
+};
 pub use runtime::{
     get_actions_runtime_status, get_runtime_status, restart_actions_runtime, restart_runtime,
     start_actions_runtime, start_runtime, stop_actions_runtime, stop_runtime,

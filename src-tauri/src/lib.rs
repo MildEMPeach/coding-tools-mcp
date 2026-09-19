@@ -11,6 +11,7 @@ mod error;
 pub mod harness;
 mod health;
 mod mcp;
+pub mod monitor;
 mod platform;
 mod runtime;
 mod secret;
@@ -27,6 +28,7 @@ use commands::{
     query_audit_records,
     get_actions_runtime_status, get_app_settings, get_download_config, get_frp_snippet,
     get_harness_dashboard,
+    list_goal_dashboard,
     get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret, get_webview_memory_sample,
     get_workspace_secret, hide_to_tray, install_software, list_frp_profiles, list_software,
     list_workspaces, open_url, open_workspace_directory, quit_app, read_workspace_logs,
@@ -37,6 +39,7 @@ use commands::{
     set_workspace_secret,
     show_main_window, start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime,
     stop_runtime, stop_tunnel, test_tunnel, uninstall_software, update_workspace,
+    create_workspace_goal, pause_workspace_goal, resume_workspace_goal, clear_workspace_goal,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -168,6 +171,7 @@ pub fn run() {
             // Recover FRP clients that stay alive while the public proxy dies
             // (common after install/restart network blips).
             tunnel::ensure_frp_health_loop();
+            monitor::ensure_monitor_loop();
             setup_tray(app)?;
             #[cfg(target_os = "windows")]
             {
@@ -196,6 +200,11 @@ pub fn run() {
             stop_runtime,
             get_runtime_status,
             get_harness_dashboard,
+            list_goal_dashboard,
+            create_workspace_goal,
+            pause_workspace_goal,
+            resume_workspace_goal,
+            clear_workspace_goal,
             start_actions_runtime,
             stop_actions_runtime,
             get_actions_runtime_status,

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::audit::AuditStore;
 use crate::harness::Harness;
+use crate::monitor::GoalMonitor;
 use crate::tools::policy::PolicySettings;
 use crate::tools::session::SessionStore;
 use crate::tools::workspace::{relative_display, Workspace};
@@ -15,6 +16,7 @@ pub struct ToolContext {
     pub tool_profile: String,
     pub permission_mode: String,
     pub harness: Harness,
+    pub monitor: GoalMonitor,
     // 审计附着在现有 ToolContext，避免修改全部工具签名；生产监听器显式启用，测试与内部
     // 构造保持 None。正式 profile_id 绑定前暂用 Harness 的稳定工作区 ID 作为兼容标签。
     audit: Option<AuditStore>,
@@ -49,13 +51,15 @@ impl ToolContext {
         permission_mode: String,
     ) -> Self {
         let harness_root = Harness::default_root().expect("无法初始化 Harness 数据目录");
-        Self::from_workspace_with_harness_root(
+        let monitor_root = GoalMonitor::default_root().expect("无法初始化 Goal Monitor 数据目录");
+        Self::from_workspace_with_roots(
             workspace,
             auth,
             policy,
             crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
             permission_mode,
             harness_root,
+            monitor_root,
         )
     }
 
@@ -67,8 +71,35 @@ impl ToolContext {
         permission_mode: String,
         harness_root: PathBuf,
     ) -> Self {
+        let monitor_root = harness_root.join("monitor-test");
+        Self::from_workspace_with_roots(
+            workspace,
+            auth,
+            policy,
+            tool_profile,
+            permission_mode,
+            harness_root,
+            monitor_root,
+        )
+    }
+
+    fn from_workspace_with_roots(
+        workspace: Workspace,
+        auth: AuthConfig,
+        policy: PolicySettings,
+        tool_profile: String,
+        permission_mode: String,
+        harness_root: PathBuf,
+        monitor_root: PathBuf,
+    ) -> Self {
         let root = workspace.root().to_path_buf();
         let harness = Harness::new(root.clone(), harness_root).expect("无法初始化 Harness");
+        let monitor = GoalMonitor::new(
+            harness.workspace_id().to_string(),
+            None,
+            monitor_root,
+        )
+        .expect("无法初始化 Goal Monitor");
         let audit_workspace_id = harness.workspace_id().to_string();
         Self {
             workspace,
@@ -77,6 +108,7 @@ impl ToolContext {
             tool_profile: crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
             permission_mode,
             harness,
+            monitor,
             audit: None,
             audit_workspace_id,
             default_cwd: Mutex::new(root),
@@ -115,6 +147,15 @@ impl ToolContext {
                 Err(error) => eprintln!("audit store disabled: {error}"),
             }
             self.audit_workspace_id = workspace_id;
+            if let Ok(root) = GoalMonitor::default_root() {
+                if let Ok(monitor) = GoalMonitor::new(
+                    self.harness.workspace_id().to_string(),
+                    Some(self.audit_workspace_id.clone()),
+                    root,
+                ) {
+                    self.monitor = monitor;
+                }
+            }
         }
         self
     }

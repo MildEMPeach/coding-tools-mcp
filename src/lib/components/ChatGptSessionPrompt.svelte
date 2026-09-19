@@ -4,6 +4,8 @@
   import { showToast } from "$lib/stores/toast";
 
   const sessionPrompt = `请初始化或恢复当前项目会话，先调用 history_session_bootstrap，并把我的首次请求逐字传入 initial_user_input。
+随后依次调用 harness_status 和 goal_status。若已有 active Goal，先恢复它的目标与 pending_steps；只要 goal_status 返回 should_continue=true，就继续推进，不要因为某个中间步骤完成就提前结束。若准备结束当前 ChatGPT 回合但 Goal 仍未完成，最后调用 goal_handoff，让 ChatGPT 内嵌 Goal 控件请求发送下一条 follow-up message 继续执行。
+当我明确要求“长期执行 / 持续推进 / 直到某条件满足”时，使用 goal_create 建立持久 Goal；阶段性进展用 goal_update，同步 completed_steps 和 pending_steps。缺少用户决策或外部资源时用 goal_block；完成项目验证后才使用 goal_complete。
 随后调用 harness_status：若已有活动任务，先用 task_context 恢复任务；若没有活动任务，而本次需求包含多文件修改、命令/测试迭代或需要跨轮次追踪，则调用 start_task 创建任务。简单查询或一次性操作可以保持 standalone，不要为了形式强制建任务。
 任务推进过程中，在完成阶段性工作或待办变化时调用 update_task；遇到基线不一致时，先用 project_state、operation_log、git_status 和 git_diff 判断外部变化，不要直接覆盖。
 任务完成前运行与项目匹配的验证；验证通过后调用 finish_task 并传 verified=true。若环境原因无法验证，只能使用 allow_unverified=true，并明确说明未验证项。
@@ -69,7 +71,7 @@
           ChatGPT 新会话启动提示词
         </h3>
         <p class="mt-0.5 text-xs leading-5 text-[var(--color-text-muted)]">
-          同时初始化历史与 Harness；复杂开发任务会进入可追踪的任务生命周期。
+          同时恢复历史、Harness 与 Goal；长期目标可持续监控并保留推进状态。
         </p>
       </div>
     </div>

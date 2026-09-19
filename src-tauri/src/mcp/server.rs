@@ -15,6 +15,31 @@ pub struct McpState {
     pub upstream: Arc<UpstreamMcpManager>,
 }
 
+fn handle_resources_read(params: &Value) -> Result<Value, Value> {
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing resource uri" }))?;
+    if uri != crate::monitor::GOAL_WIDGET_URI {
+        return Err(serde_json::json!({
+            "code": -32602,
+            "message": format!("Unknown resource: {uri}")
+        }));
+    }
+    Ok(serde_json::json!({
+        "contents": [{
+            "uri": crate::monitor::GOAL_WIDGET_URI,
+            "mimeType": "text/html;profile=mcp-app",
+            "text": crate::monitor::goal_widget_html(),
+            "_meta": {
+                "ui": {
+                    "prefersBorder": true
+                }
+            }
+        }]
+    }))
+}
+
 impl McpState {
     pub fn audit_store(&self) -> Option<AuditStore> {
         self.tools.audit_store()
@@ -56,6 +81,16 @@ pub fn handle_request_with_context(
     let result = match method {
         "initialize" => Ok(initialize_result()),
         "ping" => Ok(serde_json::json!({})),
+        "resources/list" => Ok(serde_json::json!({
+            "resources": [{
+                "uri": crate::monitor::GOAL_WIDGET_URI,
+                "name": "goal-status",
+                "title": "Goal Status",
+                "description": "Render the current coding Goal and optionally request a ChatGPT follow-up turn.",
+                "mimeType": "text/html;profile=mcp-app"
+            }]
+        })),
+        "resources/read" => handle_resources_read(&params),
         "tools/list" => {
             let mut tools = list_tools_for_profile(&state.tools.tool_profile);
             tools.extend(state.upstream.public_tools().iter().cloned());
@@ -75,11 +110,12 @@ pub fn handle_request_with_context(
 }
 
 fn initialize_result() -> Value {
-    const INSTRUCTIONS: &str = "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Immediately after bootstrap, call harness_status. If harness_status reports an active task, use task_context before continuing substantial work. If there is no active task and the user's request requires multiple code edits, command/test iterations, or durable progress tracking, call start_task with a concise objective; simple read-only questions and one-off operations may remain in standalone mode. During a tracked task, call update_task when meaningful milestones or pending steps change. Use project_state, operation_log, git_status, and git_diff to recover context or investigate a baseline mismatch. Before claiming a tracked task is complete, run the relevant project-specific verification. Call finish_task with verified=true only after verification passes; if verification cannot be run, use allow_unverified=true and state the limitation. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence.";
+    const INSTRUCTIONS: &str = "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Immediately after bootstrap, call harness_status and goal_status. If goal_status returns an active Goal, restore its objective and pending steps before taking new substantial work. When an active Goal has should_continue=true, keep working toward that Goal instead of ending the turn merely because one intermediate step finished; update it with goal_update after meaningful milestones. If progress is impossible without user input or an external dependency, use goal_block with the concrete reason. Only call goal_complete after project-specific verification passes, unless verification truly cannot run and allow_unverified=true is explicit. If the Goal is still active when you are ready to end the current ChatGPT turn, call goal_handoff as your final Goal tool call. Its MCP Apps Goal UI can request a follow-up message from ChatGPT so the web client continues the same Goal without any separate model API key. For a new request that explicitly asks for a long-running/autonomous objective or continued work until a condition is met, call goal_create; it will attach to or create the Harness Task. For ordinary multi-step coding that does not need autonomous continuation, use the Harness Task lifecycle directly. If harness_status reports an active task, use task_context before continuing substantial work. If there is no active task and the user's request requires multiple code edits, command/test iterations, or durable progress tracking, call start_task with a concise objective; simple read-only questions and one-off operations may remain in standalone mode. During a tracked task, call update_task when meaningful milestones or pending steps change. Use project_state, operation_log, git_status, and git_diff to recover context or investigate a baseline mismatch. Before claiming a tracked task is complete, run the relevant project-specific verification. Call finish_task with verified=true only after verification passes; if verification cannot be run, use allow_unverified=true and state the limitation. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The MCP server never calls an OpenAI model API itself; model reasoning remains in ChatGPT. The Goal UI uses the ChatGPT/MCP Apps follow-up-message bridge when the host supports it. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence.";
     serde_json::json!({
         "protocolVersion": "2025-06-18",
         "capabilities": {
             "tools": { "listChanged": false },
+            "resources": { "subscribe": false, "listChanged": false },
             "logging": {}
         },
         "serverInfo": {
@@ -247,10 +283,80 @@ mod tests {
     }
 
     #[test]
+    fn initialize_instructions_define_the_goal_monitor_workflow() {
+        let initialized = initialize_result();
+        let instructions = initialized["instructions"].as_str().expect("instructions");
+
+        assert!(instructions.contains("call harness_status and goal_status"));
+        assert!(instructions.contains("goal_create"));
+        assert!(instructions.contains("goal_update"));
+        assert!(instructions.contains("goal_block"));
+        assert!(instructions.contains("goal_complete"));
+        assert!(instructions.contains("should_continue=true"));
+        assert!(instructions.contains("goal_handoff"));
+        assert!(instructions.contains("MCP Apps Goal UI"));
+        assert!(instructions.contains("never calls an OpenAI model API"));
+    }
+
+    #[test]
     fn initialize_does_not_claim_tool_catalog_notifications_without_a_stream() {
         let initialized = initialize_result();
 
         assert_eq!(initialized["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(initialized["capabilities"]["resources"]["listChanged"], false);
+    }
+
+    #[test]
+    fn goal_handoff_tool_exposes_the_goal_ui_resource() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let state = Arc::new(McpState {
+            tools: Arc::new(
+                ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                    .expect("tool context"),
+            ),
+            upstream: Arc::new(UpstreamMcpManager::empty()),
+        });
+        let response = handle_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        );
+        let tools = response["result"]["tools"].as_array().expect("tools");
+        let goal = tools
+            .iter()
+            .find(|tool| tool["name"] == "goal_handoff")
+            .expect("goal_handoff");
+        assert_eq!(goal["_meta"]["ui"]["resourceUri"], crate::monitor::GOAL_WIDGET_URI);
+    }
+
+    #[test]
+    fn goal_ui_resource_is_readable_as_mcp_app_html() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let state = Arc::new(McpState {
+            tools: Arc::new(
+                ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                    .expect("tool context"),
+            ),
+            upstream: Arc::new(UpstreamMcpManager::empty()),
+        });
+        let response = handle_request(
+            &state,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"resources/read",
+                "params":{"uri": crate::monitor::GOAL_WIDGET_URI}
+            }),
+        );
+        assert_eq!(
+            response["result"]["contents"][0]["mimeType"],
+            "text/html;profile=mcp-app"
+        );
+        assert!(response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("widget html")
+            .contains("sendFollowUpMessage"));
     }
 
     #[test]

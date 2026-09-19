@@ -71,6 +71,13 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         };
     }
 
+    if crate::monitor::tools::TOOL_NAMES.contains(&name) {
+        return match crate::monitor::tools::call(ctx, name, args) {
+            Ok(value) => value,
+            Err(error) => attach_harness_status(ctx, tool_err(error), false),
+        };
+    }
+
     let task_id = if requires_write_baseline(name, &effective_args) {
         let task = ctx.harness.current_task().ok().flatten();
         if let Some(task) = task {
@@ -232,6 +239,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                 "affected_files": output.get("affected_files")
             }),
         );
+        let _ = ctx.monitor.touch_task(task_id.as_deref());
     }
     output
 }

@@ -69,6 +69,10 @@
     goto(`/workspace/${id}`);
   }
 
+  function openGoals() {
+    goto("/goals");
+  }
+
   function openFrpSettings() {
     goto("/settings/frp");
   }
@@ -153,6 +157,13 @@
   {/snippet}
   {#snippet sidebar()}
     <div class="space-y-1">
+      <div class="tx-nav-item" class:active={$page.url.pathname === "/goals"}>
+        <button type="button" class="tx-nav-button" onclick={openGoals}>
+          <span class="size-2 rounded-full bg-[var(--primary)]"></span>
+          <span class="min-w-0 flex-1 truncate text-sm font-medium">目标监控</span>
+        </button>
+      </div>
+      <div class="my-2 border-t border-[var(--color-border)]"></div>
       {#each $workspaces as workspace (workspace.id)}
         <WorkspaceNavItem
           workspace={workspace}
