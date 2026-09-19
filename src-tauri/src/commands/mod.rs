@@ -3,6 +3,7 @@ mod app_info;
 mod audit;
 mod frp_profiles;
 mod health;
+mod harness;
 mod logs;
 pub(crate) mod runtime;
 mod secrets;
@@ -25,6 +26,7 @@ pub use frp_profiles::{
     save_frp_profile, set_last_workspace, set_proxy,
 };
 pub use health::run_health_checks;
+pub use harness::get_harness_dashboard;
 pub use logs::read_workspace_logs;
 pub use runtime::{
     get_actions_runtime_status, get_runtime_status, restart_actions_runtime, restart_runtime,

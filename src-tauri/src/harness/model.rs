@@ -16,7 +16,9 @@ pub struct CapabilityStatus {
 pub struct HarnessStatus {
     pub schema_version: u32,
     pub workspace_id: String,
+    pub mode: String,
     pub task_id: Option<String>,
+    pub task_objective: Option<String>,
     pub task_state: Option<TaskStatus>,
     pub task_updated_at: Option<String>,
     pub writable: bool,

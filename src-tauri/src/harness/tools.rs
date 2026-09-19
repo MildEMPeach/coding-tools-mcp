@@ -104,14 +104,36 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         .get("allow_unverified")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let status = if allow_unverified {
-        TaskStatus::CompletedUnverified
+    let verified = args
+        .get("verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let current = ctx.harness.task(task_id).map_err(map_error)?;
+    let task = if allow_unverified {
+        ctx.harness
+            .transition(task_id, TaskStatus::CompletedUnverified)
+            .map_err(map_error)?
+    } else if verified {
+        if current.status == TaskStatus::Active {
+            ctx.harness
+                .transition(task_id, TaskStatus::Verifying)
+                .map_err(map_error)?;
+        }
+        ctx.harness
+            .transition(task_id, TaskStatus::Completed)
+            .map_err(map_error)?
     } else {
-        TaskStatus::Verifying
+        ctx.harness
+            .transition(task_id, TaskStatus::Verifying)
+            .map_err(map_error)?
     };
-    let task = ctx.harness.transition(task_id, status).map_err(map_error)?;
     let summary = change_summary(ctx, &json!({"task_id": task_id}))?;
-    Ok(json!({"task": task, "change_summary": summary}))
+    let next = if task.status == TaskStatus::Verifying {
+        vec!["run project-specific verification", "finish_task with verified=true"]
+    } else {
+        Vec::new()
+    };
+    Ok(json!({"task": task, "change_summary": summary, "next": next}))
 }
 
 fn task_context(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -212,5 +234,68 @@ fn tool_error(code: &'static str, message: impl Into<String>) -> WorkspaceError 
             code,
             "TASK_ALREADY_ACTIVE" | "FILE_CHANGED_EXTERNALLY" | "BASELINE_STALE"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::context::ToolContext;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context");
+        (workspace, harness_root, ctx)
+    }
+
+    #[test]
+    fn verified_finish_closes_active_task() {
+        let (_workspace, _harness_root, ctx) = context();
+        let started = call(
+            &ctx,
+            "start_task",
+            &json!({"objective": "验证 Harness 完成闭环"}),
+        )
+        .expect("start");
+        let task_id = started["task"]["id"].as_str().expect("task id");
+
+        let finished = call(
+            &ctx,
+            "finish_task",
+            &json!({"task_id": task_id, "verified": true}),
+        )
+        .expect("finish");
+
+        assert_eq!(finished["task"]["status"], "completed");
+        assert!(ctx.harness.current_task().expect("current task").is_none());
+    }
+
+    #[test]
+    fn unverified_finish_enters_verifying_with_next_action() {
+        let (_workspace, _harness_root, ctx) = context();
+        let started = call(
+            &ctx,
+            "start_task",
+            &json!({"objective": "等待项目验证"}),
+        )
+        .expect("start");
+        let task_id = started["task"]["id"].as_str().expect("task id");
+
+        let finishing = call(&ctx, "finish_task", &json!({"task_id": task_id}))
+            .expect("finish");
+
+        assert_eq!(finishing["task"]["status"], "verifying");
+        assert_eq!(
+            finishing["next"][1],
+            "finish_task with verified=true"
+        );
     }
 }

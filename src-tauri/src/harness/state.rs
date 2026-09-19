@@ -255,6 +255,10 @@ impl Harness {
             .list_operations(&self.workspace_id, offset, limit)
     }
 
+    pub fn recent_operations(&self, limit: usize) -> HarnessResult<Vec<OperationRecord>> {
+        self.store.recent_operations(&self.workspace_id, limit)
+    }
+
     pub fn project_state(&self, max_files: usize) -> HarnessResult<ProjectState> {
         let current = capture_baseline(&self.workspace_root);
         let task = self.current_task()?;
@@ -343,7 +347,7 @@ impl Harness {
                 git_value(&self.workspace_root, &["rev-parse", "HEAD"]),
             ),
         };
-        let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
+        let (task_id, task_objective, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
                     let current = current.as_ref().expect("active task has a baseline");
@@ -357,6 +361,7 @@ impl Harness {
                     };
                     (
                         Some(task.id.clone()),
+                        Some(task.objective.clone()),
                         Some(task.status),
                         Some(task.updated_at.clone()),
                         matches && task.status.is_writable(),
@@ -365,6 +370,7 @@ impl Harness {
                     )
                 }
                 None => (
+                    None,
                     None,
                     None,
                     None,
@@ -460,7 +466,9 @@ impl Harness {
         Ok(HarnessStatus {
             schema_version: SCHEMA_VERSION,
             workspace_id: self.workspace_id.clone(),
+            mode: if task_id.is_some() { "task" } else { "standalone" }.into(),
             task_id,
+            task_objective,
             task_state,
             task_updated_at,
             writable,
@@ -676,9 +684,29 @@ mod tests {
 
         let status = harness.status().expect("status");
         assert!(status.writable);
+        assert_eq!(status.mode, "standalone");
+        assert!(status.task_objective.is_none());
         assert_eq!(status.capabilities["read"].status, "available");
         assert_eq!(status.capabilities["write"].status, "available");
         assert!(status.next_actions.contains(&"start_task".to_string()));
+    }
+
+    #[test]
+    fn tracked_status_exposes_task_mode_and_objective() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+
+        harness.start_task("实现 Harness 工作流").expect("start task");
+        let status = harness.status().expect("status");
+        assert_eq!(status.mode, "task");
+        assert_eq!(status.task_objective.as_deref(), Some("实现 Harness 工作流"));
+        assert!(status.task_id.is_some());
     }
 
     #[test]

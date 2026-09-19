@@ -240,7 +240,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 - **进度可追溯**：每轮任务完成后可保存结构化检查点，决策、修改、测试结果和下一步都留在项目目录中。
 - **多工作区管理**：一个桌面客户端可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
 - **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
-- **默认工具面保持简单**：稳定的核心工具默认可用，高级 Harness 能力按需开启。
+- **Harness 默认可用**：核心工具档位直接提供任务状态、操作记录、项目状态和变更摘要；简单操作仍可保持 standalone，不强制创建 Task。
 
 ## 让项目记住每次对话
 
@@ -284,19 +284,25 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 | Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
 | 环境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
 | 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate`、`history_session_search`、`history_session_read` |
+| Harness | `harness_status`、`operation_log`、`project_state`、`start_task`、`update_task`、`finish_task`、`task_context`、`change_summary`、`patch_check` |
 
 典型开发过程：
 
 ```text
 打开 Workspace
+  → history_session_bootstrap + harness_status
+  → 复杂任务 start_task；简单操作保持 standalone
   → 理解项目和 Git 状态
   → 搜索并读取代码
   → 事务化应用 Patch
+  → update_task 记录阶段进展
   → 运行命令和测试
   → 检查 diff 并提交
+  → 验证通过后 finish_task(verified=true)
+  → history_session_checkpoint
 ```
 
-高级 profile 还保留项目状态、操作记录等 Harness 能力，但普通文件修改和命令执行不要求先创建 Task。
+`core` 是默认推荐档位；`advanced` 会进一步暴露全部诊断工具。Harness 采用 Workspace-first 模型，因此普通文件修改和命令执行不要求先创建 Task，只有需要多步推进、跨轮次恢复或更完整审计时才建议进入 Task 模式。
 
 ## 权限与恢复模型
 

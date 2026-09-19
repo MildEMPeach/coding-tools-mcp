@@ -17,7 +17,8 @@
   }
 
   const TOOL_PROFILE_OPTIONS = [
-    { value: "full", label: "完整工具" },
+    { value: "core", label: "核心工具（含 Harness）" },
+    { value: "advanced", label: "高级工具（全部）" },
     { value: "read-only", label: "只读工具" },
     { value: "compat-readonly-all", label: "兼容只读" },
   ] as const;
@@ -30,19 +31,23 @@
 
   let { toolProfile, permissionMode, allowedCommands, workspaceLocalEntries, workspaceScriptExtensions, onSave }: Props = $props();
 
-  let draftProfile = $state("full");
+  let draftProfile = $state("core");
   let draftMode = $state("trusted");
   let draftCommands = $state("");
   let draftLocalEntries = $state(true);
   let draftExtensions = $state(".exe,.bat,.cmd,.ps1");
   let saving = $state(false);
 
+  function normalizeProfile(value: string): string {
+    return value === "full" ? "core" : value;
+  }
+
   const dirty = $derived(
-    draftProfile !== toolProfile || draftMode !== permissionMode || draftCommands !== allowedCommands || draftLocalEntries !== workspaceLocalEntries || draftExtensions !== workspaceScriptExtensions,
+    draftProfile !== normalizeProfile(toolProfile) || draftMode !== permissionMode || draftCommands !== allowedCommands || draftLocalEntries !== workspaceLocalEntries || draftExtensions !== workspaceScriptExtensions,
   );
 
   $effect(() => {
-    draftProfile = toolProfile;
+    draftProfile = normalizeProfile(toolProfile);
     draftMode = permissionMode;
     draftCommands = allowedCommands;
     draftLocalEntries = workspaceLocalEntries;
@@ -102,7 +107,7 @@
     </select>
   </label>
   <p class="text-xs text-[var(--color-text-muted)]">
-    Workspace 本地入口按当前工作目录解析；系统命令与脚本类型均可按项目配置。当前执行边界仍为 policy_only。
+    核心工具已包含 Harness 状态、任务生命周期、变更摘要和 Patch 预检；高级工具会暴露全部诊断能力。Workspace 本地入口按当前工作目录解析。
   </p>
   <div class="flex justify-end pt-1">
     <button

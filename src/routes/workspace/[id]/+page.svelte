@@ -7,6 +7,7 @@
   } from "$lib/components/ActionsPolicyForm.svelte";
   import AuthConfigForm from "$lib/components/AuthConfigForm.svelte";
   import HealthPanel from "$lib/components/HealthPanel.svelte";
+  import HarnessPanel from "$lib/components/HarnessPanel.svelte";
   import LogViewer from "$lib/components/LogViewer.svelte";
   import RuntimePolicyForm, {
     type RuntimePolicyDraft,
@@ -644,6 +645,7 @@
             publicMcpEndpoint={mcpPublic}
             {frpProfiles}
           />
+          <HarnessPanel workspaceId={workspaceId!} />
         </div>
 
         <div class="mt-5">

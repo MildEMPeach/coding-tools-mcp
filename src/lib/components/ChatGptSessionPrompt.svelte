@@ -4,6 +4,9 @@
   import { showToast } from "$lib/stores/toast";
 
   const sessionPrompt = `请初始化或恢复当前项目会话，先调用 history_session_bootstrap，并把我的首次请求逐字传入 initial_user_input。
+随后调用 harness_status：若已有活动任务，先用 task_context 恢复任务；若没有活动任务，而本次需求包含多文件修改、命令/测试迭代或需要跨轮次追踪，则调用 start_task 创建任务。简单查询或一次性操作可以保持 standalone，不要为了形式强制建任务。
+任务推进过程中，在完成阶段性工作或待办变化时调用 update_task；遇到基线不一致时，先用 project_state、operation_log、git_status 和 git_diff 判断外部变化，不要直接覆盖。
+任务完成前运行与项目匹配的验证；验证通过后调用 finish_task 并传 verified=true。若环境原因无法验证，只能使用 allow_unverified=true，并明确说明未验证项。
 如果没有历史记录，则创建首个 history-session；如果已有历史记录，先阅读返回的有界 state。
 需要早期精确细节时，先调用 history_session_search，再用 history_session_read 分页读取相关原始 Markdown，并根据 next_cursor 继续直到完成；不要要求 bootstrap 返回全部历史。
 本会话每轮任务完成后调用 history_session_checkpoint，并原样传入 bootstrap 返回的 session_key 和 current_path，以及我本轮请求的逐字 raw_user_input。
@@ -66,7 +69,7 @@
           ChatGPT 新会话启动提示词
         </h3>
         <p class="mt-0.5 text-xs leading-5 text-[var(--color-text-muted)]">
-          首次使用会初始化历史；后续新会话会自动恢复已有进度。
+          同时初始化历史与 Harness；复杂开发任务会进入可追踪的任务生命周期。
         </p>
       </div>
     </div>

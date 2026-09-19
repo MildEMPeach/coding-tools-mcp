@@ -197,7 +197,7 @@ fn advanced_profile_exposes_every_declared_tool() {
 }
 
 #[test]
-fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
+fn core_profile_exposes_history_and_harness_workflows() {
     let tools = coding_tools_mcp_desktop_lib::tools::list_tools_for_profile("core");
     let names = tools
         .iter()
@@ -208,15 +208,22 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 26);
+    assert_eq!(names.len(), 38);
     assert!(names.contains("grep_text"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));
     assert!(names.contains("history_session_search"));
     assert!(names.contains("history_session_read"));
-    assert!(!names.contains("harness_status"));
-    assert!(!names.contains("start_task"));
+    assert!(names.contains("harness_status"));
+    assert!(names.contains("operation_log"));
+    assert!(names.contains("project_state"));
+    assert!(names.contains("start_task"));
+    assert!(names.contains("update_task"));
+    assert!(names.contains("finish_task"));
+    assert!(names.contains("task_context"));
+    assert!(names.contains("change_summary"));
+    assert!(names.contains("patch_check"));
 }
 
 #[test]

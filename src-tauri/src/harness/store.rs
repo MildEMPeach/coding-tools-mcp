@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -152,6 +153,32 @@ impl HarnessStore {
             }
         }
         Ok(operations)
+    }
+
+    pub fn recent_operations(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> HarnessResult<Vec<OperationRecord>> {
+        let path = self.operations_path(workspace_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.max(1);
+        let file = File::open(path).map_err(io_error)?;
+        let mut recent = VecDeque::with_capacity(limit);
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(io_error)?;
+            let operation = match serde_json::from_str::<OperationRecord>(&line) {
+                Ok(operation) => operation,
+                Err(_) => break,
+            };
+            if recent.len() == limit {
+                recent.pop_front();
+            }
+            recent.push_back(operation);
+        }
+        Ok(recent.into_iter().rev().collect())
     }
 
     pub fn list_events(

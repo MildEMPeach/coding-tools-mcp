@@ -108,7 +108,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "finish_task",
         "Finish task",
-        "Finish a task with verification status and change summary.",
+        "Move a tracked task into verification, or complete it with verified=true after project-specific checks pass. Use allow_unverified=true only when verification cannot be run.",
         false,
         false,
         false,
@@ -317,6 +317,8 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
 
 /// old Python 版本默认提供的核心工具集。默认 MCP 只暴露这一组，保持 Agent 的工具面稳定。
 pub const CORE_TOOLS: &[&str] = &[
+    "harness_status",
+    "operation_log",
     "server_info",
     "history_session_bootstrap",
     "history_session_checkpoint",
@@ -331,6 +333,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "list_files",
     "search_text",
     "grep_text",
+    "patch_check",
     "apply_patch",
     "exec_command",
     "write_stdin",
@@ -341,11 +344,22 @@ pub const CORE_TOOLS: &[&str] = &[
     "git_log",
     "git_show",
     "git_blame",
+    "project_state",
+    "start_task",
+    "update_task",
+    "pause_task",
+    "resume_task",
+    "finish_task",
+    "task_context",
+    "list_task_events",
+    "change_summary",
     "request_permissions",
     "view_image",
 ];
 
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
+    "harness_status",
+    "operation_log",
     "server_info",
     "check_exec_environment",
     "get_default_cwd",
@@ -355,12 +369,17 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "list_files",
     "search_text",
     "grep_text",
+    "patch_check",
     "read_output",
     "git_status",
     "git_diff",
     "git_log",
     "git_show",
     "git_blame",
+    "project_state",
+    "task_context",
+    "list_task_events",
+    "change_summary",
     "request_permissions",
     "view_image",
 ];
@@ -640,6 +659,7 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "task_id": { "type": "string", "minLength": 1 },
                 "summary": { "type": "string" },
+                "verified": { "type": "boolean", "default": false, "description": "Set true only after project-specific verification has passed. This completes a task that is Active or Verifying." },
                 "allow_unverified": { "type": "boolean", "default": false }
             },
             "required": ["task_id"],
