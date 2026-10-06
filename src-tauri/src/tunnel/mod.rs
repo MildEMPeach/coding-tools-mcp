@@ -22,6 +22,7 @@ pub use cloudflare::{
 pub use frp::{actions_frp_snippet, mcp_frp_snippet};
 #[allow(unused_imports)]
 pub use openai::{resolve_tunnel_client, spawn_openai_tunnel, valid_tunnel_id};
+pub(crate) use openai::check_control_plane;
 #[allow(unused_imports)]
 pub use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 #[allow(unused_imports)]

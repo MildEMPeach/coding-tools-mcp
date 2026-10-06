@@ -331,9 +331,15 @@ pub async fn spawn_frpc(
     // 任一路由要求使用代理时，为整个聚合连接启用代理；这样 HashMap
     // 的迭代顺序不会随机决定最终行为，也不会因偏好不同丢弃其它路由。
     let use_proxy = aggregate_uses_proxy(routes);
-    if use_proxy {
-        crate::tunnel::cloudflare::apply_proxy_env(&mut cmd, &settings.proxy);
-    }
+    let proxy = if use_proxy {
+        settings.proxy.clone()
+    } else {
+        crate::settings::ProxyConfig {
+            mode: "none".into(),
+            url: String::new(),
+        }
+    };
+    crate::tunnel::cloudflare::apply_proxy_env(&mut cmd, &proxy);
 
     let mut child = cmd
         .spawn()

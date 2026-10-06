@@ -200,13 +200,30 @@ pub fn extract_trycloudflare_url(line: &str) -> Option<String> {
 pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
     let url = match proxy.mode.as_str() {
         "manual" if !proxy.url.trim().is_empty() => Some(proxy.url.trim().to_string()),
-        "system" => std::env::var("HTTPS_PROXY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("HTTP_PROXY").ok().filter(|s| !s.is_empty()))
-            .or_else(|| std::env::var("ALL_PROXY").ok().filter(|s| !s.is_empty())),
+        "system" => [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ]
+        .iter()
+        .find_map(|key| std::env::var(key).ok().filter(|s| !s.trim().is_empty()))
+        .or_else(system_proxy_url),
         _ => None,
     };
+    for key in [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "TUNNEL_HTTP_PROXY",
+    ] {
+        cmd.env_remove(key);
+    }
     if let Some(url) = url {
         for key in [
             "HTTPS_PROXY",
@@ -221,6 +238,46 @@ pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
         // Some cloudflared builds consult this dedicated variable.
         cmd.env("TUNNEL_HTTP_PROXY", &url);
     }
+}
+
+fn system_proxy_url() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/scutil")
+            .arg("--proxy")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            return parse_macos_proxy(&String::from_utf8_lossy(&output.stdout));
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_proxy(output: &str) -> Option<String> {
+    let fields: std::collections::HashMap<_, _> = output
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .collect();
+    for prefix in ["HTTPS", "HTTP"] {
+        if fields.get(format!("{prefix}Enable").as_str()) != Some(&"1") {
+            continue;
+        }
+        let host = fields.get(format!("{prefix}Proxy").as_str())?;
+        let port: u16 = fields.get(format!("{prefix}Port").as_str())?.parse().ok()?;
+        if host.is_empty() || port == 0 {
+            return None;
+        }
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        return Some(format!("http://{host}:{port}"));
+    }
+    None
 }
 
 /// Spawn `cloudflared tunnel --url http://127.0.0.1:{port}` (quick) or named `tunnel run --token`.
@@ -268,9 +325,15 @@ pub async fn spawn_cloudflare_tunnel(
     }
 
     let settings = crate::settings::AppSettings::load_or_default();
-    if use_proxy {
-        apply_proxy_env(&mut cmd, &settings.proxy);
-    }
+    let proxy = if use_proxy {
+        settings.proxy.clone()
+    } else {
+        crate::settings::ProxyConfig {
+            mode: "none".into(),
+            url: String::new(),
+        }
+    };
+    apply_proxy_env(&mut cmd, &proxy);
 
     push_cloudflare_protocol_args(&mut cmd, use_http2);
 
@@ -473,6 +536,51 @@ fn push_cloudflare_protocol_args(cmd: &mut Command, use_http2: bool) {
 mod tests {
     use super::{extract_trycloudflare_url, push_cloudflare_protocol_args};
     use tokio::process::Command;
+
+    #[test]
+    fn macos_proxy_and_explicit_no_proxy() {
+        assert_eq!(
+            super::parse_macos_proxy("HTTPSEnable : 1\nHTTPSProxy : 127.0.0.1\nHTTPSPort : 7897"),
+            Some("http://127.0.0.1:7897".into())
+        );
+        assert_eq!(
+            super::parse_macos_proxy("HTTPEnable : 1\nHTTPProxy : ::1\nHTTPPort : 7897"),
+            Some("http://[::1]:7897".into())
+        );
+        assert_eq!(
+            super::parse_macos_proxy("HTTPSEnable : 0\nHTTPSProxy : localhost\nHTTPSPort : 7897"),
+            None
+        );
+        let mut cmd = Command::new("unused");
+        cmd.env("HTTPS_PROXY", "http://stale:1");
+        super::apply_proxy_env(
+            &mut cmd,
+            &crate::settings::ProxyConfig {
+                mode: "none".into(),
+                url: String::new(),
+            },
+        );
+        assert!(cmd
+            .as_std()
+            .get_envs()
+            .filter(|(key, _)| key
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("proxy"))
+            .all(|(_, value)| value.is_none()));
+        super::apply_proxy_env(
+            &mut cmd,
+            &crate::settings::ProxyConfig {
+                mode: "manual".into(),
+                url: "http://localhost:7897".into(),
+            },
+        );
+        assert!(cmd
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "HTTPS_PROXY"
+                && value == Some(std::ffi::OsStr::new("http://localhost:7897"))));
+    }
 
     fn command_args(use_http2: bool) -> Vec<String> {
         let mut cmd = Command::new("cloudflared");

@@ -29,6 +29,7 @@
   let expandedOperations = $state(false);
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
   let requestGeneration = 0;
+  let refreshing = false;
 
   const completedSteps = $derived(dashboard?.task?.completed_steps ?? []);
   const pendingSteps = $derived(dashboard?.task?.pending_steps ?? []);
@@ -114,7 +115,8 @@
   }
 
   async function refresh(id = workspaceId) {
-    if (!id) return;
+    if (!id || refreshing) return;
+    refreshing = true;
     const generation = ++requestGeneration;
     loading = true;
     try {
@@ -126,7 +128,9 @@
       if (generation !== requestGeneration || id !== workspaceId) return;
       errorMessage = String(error);
     } finally {
+      refreshing = false;
       if (generation === requestGeneration) loading = false;
+      if (id !== workspaceId) void refresh();
     }
   }
 
@@ -319,7 +323,7 @@
                   : "text-[var(--color-text-secondary)]"}
             >
               {dashboard.status.baseline_matches === null
-                ? "未跟踪"
+                ? (dashboard.task ? "执行前校验" : "未跟踪")
                 : dashboard.status.baseline_matches
                   ? "Matched"
                   : "Changed"}

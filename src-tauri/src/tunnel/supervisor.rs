@@ -41,6 +41,7 @@ pub struct TunnelStatus {
 }
 
 struct TunnelSession {
+    openai_health_url: Option<String>,
     public_url: String,
     pid: Option<u32>,
     child: Option<Child>,
@@ -93,6 +94,32 @@ impl TunnelSupervisor {
             frp_routes: HashMap::new(),
             frpc: HashMap::new(),
             frpc_health: HashMap::new(),
+        }
+    }
+
+    pub fn openai_health_url(&self, workspace_id: &str) -> Option<String> {
+        self.sessions
+            .get(&(workspace_id.to_string(), TunnelServiceKind::Mcp))
+            .filter(|session| {
+                session.child.is_some()
+                    && session
+                        .pid
+                        .is_some_and(|pid| platform().is_process_alive(pid))
+            })
+            .and_then(|session| session.openai_health_url.clone())
+    }
+
+    /// Stop only children owned by this instance before Tauri exits the process.
+    pub async fn shutdown(&mut self) {
+        self.frp_routes.clear();
+        self.frpc_health.clear();
+        for (_, session) in self.sessions.drain() {
+            if let Some(child) = session.child {
+                let _ = cloudflare::stop_child(child, session.pid).await;
+            }
+        }
+        for (_, process) in self.frpc.drain() {
+            let _ = cloudflare::stop_child(process.child, process.pid).await;
         }
     }
 
@@ -396,6 +423,11 @@ impl TunnelSupervisor {
         let key = (profile.id.clone(), kind);
         let tunnel_type = tunnel_type_for(profile, kind);
         if self.session_is_running(&key) && tunnel_type != "frp" {
+            if tunnel_type == "openai" {
+                let health_url = self.openai_health_url(&profile.id)
+                    .ok_or_else(|| AppError::Message("OpenAI 隧道健康地址不可用".into()))?;
+                openai::check_control_plane(&health_url).await?;
+            }
             return Ok(self.status(profile, kind, settings));
         }
 
@@ -444,6 +476,7 @@ impl TunnelSupervisor {
             self.sessions.insert(
                 key,
                 TunnelSession {
+                    openai_health_url: None,
                     public_url: public_url.clone(),
                     pid,
                     child: None,
@@ -479,10 +512,15 @@ impl TunnelSupervisor {
                 self.restore_route_state(&key, previous_route.take(), previous_session.take());
             })?;
 
-            let OpenAiTunnelHandle { child, pid } = handle;
+            let OpenAiTunnelHandle {
+                child,
+                pid,
+                health_url,
+            } = handle;
             self.sessions.insert(
                 key,
                 TunnelSession {
+                    openai_health_url: Some(health_url),
                     // Secure MCP Tunnel is selected by tunnel_id in ChatGPT;
                     // it intentionally does not expose a public URL.
                     public_url: String::new(),
@@ -538,6 +576,7 @@ impl TunnelSupervisor {
         self.sessions.insert(
             key,
             TunnelSession {
+                openai_health_url: None,
                 public_url: public_url.clone(),
                 pid,
                 child: Some(child),
@@ -931,6 +970,7 @@ impl TunnelSupervisor {
                     self.sessions.insert(
                         key.clone(),
                         TunnelSession {
+                            openai_health_url: None,
                             public_url,
                             pid,
                             child: None,
@@ -1227,6 +1267,56 @@ mod tests {
         profile
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_reaps_owned_tunnels_and_frpc() {
+        let mut supervisor = TunnelSupervisor::new();
+        let spawn = || {
+            let mut cmd = tokio::process::Command::new("sleep");
+            cmd.arg("60").process_group(0).kill_on_drop(true);
+            cmd.spawn().unwrap()
+        };
+        let tunnel = spawn();
+        let tunnel_pid = tunnel.id().unwrap();
+        let frpc = spawn();
+        let frpc_pid = frpc.id().unwrap();
+        supervisor.sessions.insert(
+            ("test".into(), TunnelServiceKind::Mcp),
+            TunnelSession {
+                openai_health_url: None,
+                public_url: String::new(),
+                pid: Some(tunnel_pid),
+                child: Some(tunnel),
+            },
+        );
+        // FRP route entries reference a shared child; never kill their pid separately.
+        supervisor.sessions.insert(
+            ("test".into(), TunnelServiceKind::Actions),
+            TunnelSession {
+                openai_health_url: None,
+                public_url: String::new(),
+                pid: Some(1),
+                child: None,
+            },
+        );
+        supervisor.frpc.insert(
+            "test".into(),
+            FrpcProcess {
+                child: frpc,
+                pid: Some(frpc_pid),
+            },
+        );
+        let mut profile = frp_profile("test", "demo");
+        profile.id = "test".into();
+        profile.tunnel.tunnel_type = "openai".into();
+        // A living daemon without a healthy control plane must not pass a retest.
+        assert!(supervisor.start(&profile, TunnelServiceKind::Mcp, &AppSettings::default()).await.is_err());
+        supervisor.shutdown().await;
+        assert!(supervisor.sessions.is_empty() && supervisor.frpc.is_empty());
+        assert!(!crate::platform::platform().is_process_alive(tunnel_pid));
+        assert!(!crate::platform::platform().is_process_alive(frpc_pid));
+    }
+
     #[test]
     fn active_routes_reject_duplicate_subdomains_case_insensitively() {
         let settings = AppSettings::default();
@@ -1381,6 +1471,7 @@ mod tests {
         supervisor.sessions.insert(
             stale_key,
             TunnelSession {
+                openai_health_url: None,
                 public_url: "https://old.frp.example.com".into(),
                 pid: Some(1),
                 child: None,

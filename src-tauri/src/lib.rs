@@ -99,7 +99,7 @@ fn signal_existing_instance() -> bool {
         loop {
             let _ = unsafe { WaitForSingleObject(event, INFINITE) };
             if let Some(app) = SHOW_APP_HANDLE.get() {
-                let _ = commands::window_chrome::show_main_window(app.clone());
+                commands::window_chrome::request_show_main_window(app.clone());
             }
         }
     });
@@ -132,7 +132,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .tooltip("Coding Tools MCP")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
-                let _ = commands::window_chrome::show_main_window(app.clone());
+                commands::window_chrome::request_show_main_window(app.clone());
             }
             "quit" => {
                 commands::window_chrome::arm_allow_exit();
@@ -147,7 +147,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let _ = commands::window_chrome::show_main_window(tray.app_handle().clone());
+                commands::window_chrome::request_show_main_window(tray.app_handle().clone());
             }
         });
 
@@ -245,6 +245,15 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                commands::window_chrome::request_show_main_window(app_handle.clone());
+            }
+            tauri::RunEvent::Exit => {
+                tauri::async_runtime::block_on(async {
+                    tunnel::supervisor().lock().await.shutdown().await;
+                });
+            }
             tauri::RunEvent::ExitRequested { api, .. } => {
                 // While recreating the UI WebView we temporarily destroy the main
                 // window; without prevent_exit Tauri would quit the whole process

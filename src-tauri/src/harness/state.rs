@@ -329,17 +329,32 @@ impl Harness {
     }
 
     pub fn status(&self) -> HarnessResult<HarnessStatus> {
-        self.status_with_baseline(|| capture_baseline(&self.workspace_root))
+        self.status_with_baseline(true, || capture_baseline(&self.workspace_root))
+    }
+
+    /// Read-only UI polling must not hash the worktree. Mutations still check it.
+    pub fn status_summary(&self) -> HarnessResult<HarnessStatus> {
+        let mut status = self.status_with_baseline(false, || unreachable!("summary must not scan files"))?;
+        if status.task_state.is_some_and(|state| state.is_writable()) {
+            for name in ["write", "exec"] {
+                if let Some(capability) = status.capabilities.get_mut(name) {
+                    capability.status = "managed_by_policy".into();
+                    capability.reason = "工作区基线将在写入和执行前校验".into();
+                }
+            }
+        }
+        Ok(status)
     }
 
     fn status_with_baseline(
         &self,
+        verify_baseline: bool,
         capture: impl FnOnce() -> ProjectBaseline,
     ) -> HarnessResult<HarnessStatus> {
         let task = self.current_task()?;
         // Standalone errors/status need Git metadata, not a snapshot of every
         // file. A home-directory workspace may contain OS-protected media.
-        let current = task.as_ref().map(|_| capture());
+        let current = task.as_ref().filter(|_| verify_baseline).map(|_| capture());
         let (branch, head) = match current.as_ref() {
             Some(current) => (current.branch.clone(), current.head.clone()),
             None => (
@@ -350,22 +365,21 @@ impl Harness {
         let (task_id, task_objective, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
-                    let current = current.as_ref().expect("active task has a baseline");
-                    let matches = task.baseline.branch == current.branch
+                    let matches = current.as_ref().map(|current| task.baseline.branch == current.branch
                         && task.baseline.head == current.head
-                        && task.expected_fingerprint == current.worktree_fingerprint;
-                    let reason = if matches {
-                        "任务可继续执行"
-                    } else {
-                        "工作区基线已变化，写入和执行已暂停"
+                        && task.expected_fingerprint == current.worktree_fingerprint);
+                    let reason = match matches {
+                        Some(true) => "任务可继续执行",
+                        Some(false) => "工作区基线已变化，写入和执行已暂停",
+                        None => "已读取任务状态；工作区基线将在写入和执行前校验",
                     };
                     (
                         Some(task.id.clone()),
                         Some(task.objective.clone()),
                         Some(task.status),
                         Some(task.updated_at.clone()),
-                        matches && task.status.is_writable(),
-                        Some(matches),
+                        matches == Some(true) && task.status.is_writable(),
+                        matches,
                         reason.to_string(),
                     )
                 }
@@ -457,7 +471,7 @@ impl Harness {
             next_actions.push("project_state".into());
             next_actions.push("git_diff".into());
             next_actions.push("refresh_baseline".into());
-        } else if !writable {
+        } else if !writable && verify_baseline {
             next_actions.push("resume_task".into());
         }
         next_actions.push("read_file".into());
@@ -665,10 +679,32 @@ mod tests {
         fs::create_dir(workspace.path().join("Music")).unwrap();
         fs::write(workspace.path().join("Music/private-library"), "unrelated data").unwrap();
         let harness = Harness::new(workspace.path().to_path_buf(), harness_root.path().to_path_buf()).unwrap();
-        let status = harness.status_with_baseline(|| panic!("standalone status must not scan files")).unwrap();
+        let status = harness.status_with_baseline(true, || panic!("standalone status must not scan files")).unwrap();
         assert!(status.task_id.is_none());
         assert!(status.writable);
         assert_eq!(status.baseline_matches, None);
+    }
+
+    #[test]
+    fn task_summary_never_scans_but_mutations_still_check_baseline() {
+        let workspace = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let file = workspace.path().join("data.bin");
+        fs::write(&file, "before").unwrap();
+        let harness = Harness::new(workspace.path().into(), storage.path().into()).unwrap();
+        let task = harness.start_task("test summary").unwrap();
+        // Also exercise task schemas with explicit ignored paths.
+        let mut saved = serde_json::to_value(&task).unwrap();
+        saved["ignored_paths"] = json!(["ignored"]);
+        let task: TaskSession = serde_json::from_value(saved).unwrap();
+        harness.store.save_task(&task).unwrap();
+        fs::write(&file, "external change").unwrap();
+        let summary = harness.status_summary().unwrap();
+        assert_eq!(summary.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(summary.baseline_matches, None);
+        assert!(!summary.writable);
+        assert_eq!(harness.status().unwrap().baseline_matches, Some(false));
+        assert!(harness.check_baseline(&task.id).is_err());
     }
 
     #[test]

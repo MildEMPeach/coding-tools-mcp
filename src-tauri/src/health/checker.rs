@@ -138,18 +138,25 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
                 .flatten()
                 .is_some_and(|value| !value.trim().is_empty());
             let embedded_oauth = profile.auth.oauth_enabled();
-            let ready = id_ok && client_ok && secret_ok && !embedded_oauth;
+            let configured = id_ok && client_ok && secret_ok && !embedded_oauth;
+            let health_url = crate::tunnel::supervisor().lock().await.openai_health_url(&profile.id);
+            let connection = match health_url {
+                Some(url) => crate::tunnel::check_control_plane(&url).await,
+                None => Err(crate::error::AppError::Message("隧道未运行或未由当前应用管理".into())),
+            };
+            let ready = configured && connection.is_ok();
             (
                 ready,
                 if ready {
-                    format!("Secure MCP Tunnel · {}", profile.tunnel.openai_tunnel_id)
+                    format!("Secure MCP Tunnel · {} · 控制平面近期轮询成功", profile.tunnel.openai_tunnel_id)
                 } else {
                     format!(
-                        "Tunnel ID={} · tunnel-client={} · Runtime API Key={} · 内置 OAuth={}",
+                        "Tunnel ID={} · tunnel-client={} · Runtime API Key={} · 内置 OAuth={} · {}",
                         if id_ok { "OK" } else { "缺失/无效" },
                         if client_ok { "OK" } else { "未安装" },
                         if secret_ok { "OK" } else { "未配置" },
                         if embedded_oauth { "不兼容" } else { "未启用" },
+                        connection.err().map(|err| err.to_string()).unwrap_or_default(),
                     )
                 },
                 !embedded_oauth,

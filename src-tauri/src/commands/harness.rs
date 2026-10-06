@@ -35,31 +35,35 @@ fn harness_for_workspace(state: &State<'_, AppState>, id: &str) -> AppResult<Har
 }
 
 #[tauri::command]
-pub fn get_harness_dashboard(
+pub async fn get_harness_dashboard(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<HarnessDashboard> {
     let harness = harness_for_workspace(&state, &id)?;
-    let status = harness
-        .status()
-        .map_err(|error| AppError::Message(error.to_string()))?;
-    let task = harness
-        .current_task()
-        .map_err(|error| AppError::Message(error.to_string()))?
-        .map(|task| HarnessTaskSummary {
-            id: task.id,
-            objective: task.objective,
-            status: task.status,
-            completed_steps: task.completed_steps,
-            pending_steps: task.pending_steps,
-            updated_at: task.updated_at,
-        });
-    let operations = harness
-        .recent_operations(16)
-        .map_err(|error| AppError::Message(error.to_string()))?;
-    Ok(HarnessDashboard {
-        status,
-        task,
-        operations,
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = harness
+            .status_summary()
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        let task = harness
+            .current_task()
+            .map_err(|error| AppError::Message(error.to_string()))?
+            .map(|task| HarnessTaskSummary {
+                id: task.id,
+                objective: task.objective,
+                status: task.status,
+                completed_steps: task.completed_steps,
+                pending_steps: task.pending_steps,
+                updated_at: task.updated_at,
+            });
+        let operations = harness
+            .recent_operations(16)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        Ok(HarnessDashboard {
+            status,
+            task,
+            operations,
+        })
     })
+    .await
+    .map_err(|error| AppError::Message(format!("读取 Harness 状态失败: {error}")))?
 }

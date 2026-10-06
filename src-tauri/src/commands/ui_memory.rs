@@ -11,7 +11,10 @@ use crate::error::{AppError, AppResult};
 /// the sole window during UI recreate does not kill MCP/FRP with the process.
 static UI_RECREATING: AtomicBool = AtomicBool::new(false);
 
-const KEEPALIVE_LABEL: &str = "__ui_recreate_keepalive__";
+// Serialize rebuild and show: a Dock click during rebuild must show its replacement.
+pub(super) static UI_WINDOW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(super) const KEEPALIVE_LABEL: &str = "__ui_recreate_keepalive__";
 
 pub fn should_prevent_exit() -> bool {
     UI_RECREATING.load(Ordering::SeqCst)
@@ -91,6 +94,7 @@ pub fn get_webview_memory_sample() -> AppResult<WebviewMemorySample> {
 /// keepalive window first so "last window closed" never fires for the main UI.
 #[command]
 pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
+    let _window_lock = UI_WINDOW_LOCK.lock().await;
     let _guard = RecreateGuard::enter();
 
     // Drop any leftover keepalive from a previous failed attempt.
@@ -148,31 +152,7 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
     // Allow msedgewebview2 children to exit before creating a replacement.
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 
-    let new_window = match app.config().app.windows.first() {
-        Some(config) => match WebviewWindowBuilder::from_config(&app, config) {
-            Ok(builder) => builder.build().map_err(|err| {
-                AppError::Message(format!("rebuild webview from config failed: {err}"))
-            }),
-            Err(err) => Err(AppError::Message(format!(
-                "webview builder from config failed: {err}"
-            ))),
-        },
-        None => Err(AppError::Message("missing window config".into())),
-    };
-
-    let new_window = match new_window {
-        Ok(w) => w,
-        Err(config_err) => WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
-            .title("Coding Tools MCP")
-            .inner_size(1280.0, 800.0)
-            .min_inner_size(960.0, 640.0)
-            .build()
-            .map_err(|err| {
-                AppError::Message(format!(
-                    "rebuild webview failed ({config_err}); fallback also failed: {err}"
-                ))
-            })?,
-    };
+    let new_window = build_main_window(&app, &label)?;
 
     if let Some(size) = outer_size {
         let _ = new_window.set_size(tauri::Size::Physical(size));
@@ -207,4 +187,57 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+/// Reuse the same recovery path if a failed rebuild left no main window.
+pub(super) fn build_main_window(app: &AppHandle, label: &str) -> AppResult<tauri::WebviewWindow> {
+    let new_window = match app.config().app.windows.first() {
+        Some(config) => match WebviewWindowBuilder::from_config(app, config) {
+            Ok(builder) => builder.build().map_err(|err| {
+                AppError::Message(format!("rebuild webview from config failed: {err}"))
+            }),
+            Err(err) => Err(AppError::Message(format!(
+                "webview builder from config failed: {err}"
+            ))),
+        },
+        None => Err(AppError::Message("missing window config".into())),
+    };
+
+    let new_window = match new_window {
+        Ok(w) => w,
+        Err(config_err) => {
+            WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
+                .title("Coding Tools MCP")
+                .inner_size(1280.0, 800.0)
+                .min_inner_size(960.0, 640.0)
+                .build()
+                .map_err(|err| {
+                    AppError::Message(format!(
+                        "rebuild webview failed ({config_err}); fallback also failed: {err}"
+                    ))
+                })?
+        }
+    };
+
+    Ok(new_window)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn show_waits_for_rebuild_and_exit_guard_is_released() {
+        let lock = super::UI_WINDOW_LOCK.lock().await;
+        let guard = super::RecreateGuard::enter();
+        assert!(super::should_prevent_exit());
+        assert!(super::UI_WINDOW_LOCK.try_lock().is_err());
+        let show = tokio::spawn(async {
+            let _lock = super::UI_WINDOW_LOCK.lock().await;
+            assert!(!super::should_prevent_exit());
+        });
+        tokio::task::yield_now().await;
+        assert!(!show.is_finished());
+        drop(guard); // Also runs on an early rebuild error.
+        drop(lock);
+        show.await.unwrap();
+    }
 }
