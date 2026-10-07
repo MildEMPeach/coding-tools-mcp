@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,7 +11,9 @@ use super::model::{GoalHealth, GoalRecord, GoalStatus, GOAL_SCHEMA_VERSION};
 use super::store::GoalStore;
 
 const IDLE_AFTER_SECS: u64 = 20;
-static GOAL_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const GOAL_LOCK_SHARDS: usize = 64;
+static GOAL_STATE_LOCKS: LazyLock<[Mutex<()>; GOAL_LOCK_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
 
 #[derive(Debug, Clone)]
 pub struct GoalMonitor {
@@ -32,6 +35,32 @@ impl GoalMonitor {
         })
     }
 
+    pub fn rebind_task(&self, goal_id: &str, task_id: &str) -> HarnessResult<GoalRecord> {
+        let _guard = lock_goal_state(&self.workspace_id)?;
+        let mut goal = self.goal_unlocked(goal_id)?;
+        if goal.status.is_terminal() {
+            return Err(HarnessError::new(
+                "GOAL_TERMINAL",
+                "终态 Goal 不能重新绑定 Harness Task",
+            ));
+        }
+        goal.task_id = Some(task_id.to_string());
+        if !goal.task_epochs.iter().any(|id| id == task_id) {
+            goal.task_epochs.push(task_id.to_string());
+        }
+        goal.status = GoalStatus::Active;
+        goal.health = GoalHealth::Running;
+        goal.should_continue = goal.auto_continue;
+        goal.needs_attention = false;
+        goal.blocked_reason = None;
+        goal.monitor_message = format!("Goal 已切换到新的 Harness execution epoch {task_id}");
+        let now = timestamp();
+        goal.last_activity_at = now.clone();
+        goal.updated_at = now;
+        self.store.save_goal(&goal)?;
+        Ok(goal)
+    }
+
     pub fn default_root() -> HarnessResult<PathBuf> {
         let root = dirs::data_local_dir()
             .or_else(dirs::data_dir)
@@ -49,7 +78,7 @@ impl GoalMonitor {
         if objective.trim().is_empty() {
             return Err(HarnessError::new("INVALID_ARGUMENT", "Goal objective 不能为空"));
         }
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         if let Some(existing) = self.current_goal_unlocked()? {
             return Err(HarnessError::new(
                 "GOAL_ALREADY_ACTIVE",
@@ -62,7 +91,9 @@ impl GoalMonitor {
             id: Uuid::new_v4().simple().to_string(),
             workspace_id: self.workspace_id.clone(),
             profile_id: self.profile_id.clone(),
-            task_id,
+            task_id: task_id.clone(),
+            task_epochs: task_id.iter().cloned().collect(),
+            superseded_by_goal_id: None,
             objective: objective.trim().to_string(),
             status: GoalStatus::Active,
             health: GoalHealth::Running,
@@ -79,24 +110,42 @@ impl GoalMonitor {
             last_progress_at: now.clone(),
             continuation_count: 0,
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
         };
         self.store.save_goal(&goal)?;
+        for mut previous in self.store.list_goals(&self.workspace_id)? {
+            if previous.id == goal.id
+                || previous.superseded_by_goal_id.is_some()
+                || previous.objective.trim() != goal.objective.trim()
+            {
+                continue;
+            }
+            previous.superseded_by_goal_id = Some(goal.id.clone());
+            previous.updated_at = now.clone();
+            if previous.status.is_current() {
+                previous.status = GoalStatus::Cleared;
+                previous.health = GoalHealth::Cleared;
+                previous.should_continue = false;
+                previous.needs_attention = false;
+            }
+            previous.monitor_message = format!("已被后续 Goal {} 替代", goal.id);
+            self.store.save_goal(&previous)?;
+        }
         Ok(goal)
     }
 
     pub fn goal(&self, goal_id: &str) -> HarnessResult<GoalRecord> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         self.goal_unlocked(goal_id)
     }
 
     pub fn list_goals(&self) -> HarnessResult<Vec<GoalRecord>> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         self.list_goals_unlocked()
     }
 
     pub fn current_goal(&self) -> HarnessResult<Option<GoalRecord>> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         self.current_goal_unlocked()
     }
 
@@ -122,7 +171,7 @@ impl GoalMonitor {
         pending_steps: Option<Vec<String>>,
         note: Option<String>,
     ) -> HarnessResult<GoalRecord> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         let mut goal = self.goal_unlocked(goal_id)?;
         if goal.status.is_terminal() {
             return Err(HarnessError::new("GOAL_TERMINAL", "已结束 Goal 不能继续更新"));
@@ -163,7 +212,7 @@ impl GoalMonitor {
         status: GoalStatus,
         reason: Option<String>,
     ) -> HarnessResult<GoalRecord> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         let mut goal = self.goal_unlocked(goal_id)?;
         if !goal.status.can_transition_to(status) {
             return Err(HarnessError::new(
@@ -221,7 +270,7 @@ impl GoalMonitor {
     }
 
     pub fn touch_task(&self, task_id: Option<&str>) -> HarnessResult<()> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         let Some(mut goal) = self.current_goal_unlocked()? else {
             return Ok(());
         };
@@ -243,7 +292,7 @@ impl GoalMonitor {
     }
 
     pub fn record_continuation(&self, goal_id: &str) -> HarnessResult<GoalRecord> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         let mut goal = self.goal_unlocked(goal_id)?;
         if goal.status != GoalStatus::Active {
             return Ok(goal);
@@ -259,7 +308,7 @@ impl GoalMonitor {
     }
 
     pub fn refresh_current(&self, harness: &Harness) -> HarnessResult<Option<GoalRecord>> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         let Some(goal) = self.current_goal_unlocked()? else {
             return Ok(None);
         };
@@ -267,7 +316,7 @@ impl GoalMonitor {
     }
 
     pub fn refresh_goal(&self, goal_id: &str, harness: &Harness) -> HarnessResult<GoalRecord> {
-        let _guard = lock_goal_state()?;
+        let _guard = lock_goal_state(&self.workspace_id)?;
         self.refresh_goal_unlocked(goal_id, harness)
     }
 
@@ -282,11 +331,23 @@ impl GoalMonitor {
             if let Ok(task) = harness.task(task_id) {
                 latest_ms = latest_ms.max(parse_ms(&task.updated_at));
                 if matches!(task.status, TaskStatus::Completed | TaskStatus::CompletedUnverified) {
-                    goal.status = GoalStatus::Completed;
-                    goal.health = GoalHealth::Completed;
-                    goal.should_continue = false;
-                    goal.needs_attention = false;
-                    goal.monitor_message = "关联 Harness Task 已完成".into();
+                    goal.health = GoalHealth::Idle;
+                    goal.should_continue = goal.auto_continue;
+                    goal.needs_attention = !goal.pending_steps.is_empty();
+                    goal.monitor_message = if goal.pending_steps.is_empty() {
+                        "关联 Harness Task 已完成；Goal 仍保持 active，等待显式 goal_complete()".into()
+                    } else {
+                        "关联 Harness Task execution epoch 已结束，但 Goal 仍有 pending_steps；请创建/选择新 Task 并调用 goal_rebind_task".into()
+                    };
+                    goal.updated_at = timestamp();
+                    self.store.save_goal(&goal)?;
+                    return Ok(goal);
+                }
+                if task.status == TaskStatus::Abandoned {
+                    goal.health = GoalHealth::Idle;
+                    goal.needs_attention = true;
+                    goal.should_continue = goal.auto_continue;
+                    goal.monitor_message = "关联 Harness Task 已放弃；Goal 保持 active，请绑定新的 execution epoch".into();
                     goal.updated_at = timestamp();
                     self.store.save_goal(&goal)?;
                     return Ok(goal);
@@ -374,8 +435,11 @@ fn parse_ms(value: &str) -> u64 {
     value.parse::<u64>().unwrap_or(0)
 }
 
-fn lock_goal_state() -> HarnessResult<MutexGuard<'static, ()>> {
-    GOAL_STATE_LOCK
+fn lock_goal_state(workspace_id: &str) -> HarnessResult<MutexGuard<'static, ()>> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    workspace_id.hash(&mut hasher);
+    let shard = (hasher.finish() as usize) % GOAL_LOCK_SHARDS;
+    GOAL_STATE_LOCKS[shard]
         .lock()
         .map_err(|_| HarnessError::new("STORE_LOCK_POISONED", "Goal Monitor 状态锁已损坏"))
 }
@@ -413,6 +477,90 @@ mod tests {
         assert_eq!(completed.health, GoalHealth::Completed);
         assert!(monitor.current_goal().expect("current").is_none());
         assert!(fs::read_dir(store.path()).is_ok());
+    }
+
+    #[test]
+    fn completed_harness_task_does_not_complete_long_running_goal() {
+        let workspace = tempdir().expect("workspace");
+        let harness_store = tempdir().expect("harness store");
+        let monitor_store = tempdir().expect("monitor store");
+        fs::write(workspace.path().join("main.txt"), "hello\n").expect("workspace file");
+        let harness = Harness::new(workspace.path().to_path_buf(), harness_store.path().to_path_buf())
+            .expect("harness");
+        let task = harness.start_task("长期目标").expect("task");
+        let monitor = GoalMonitor::new(
+            harness.workspace_id().to_string(),
+            Some("profile".into()),
+            monitor_store.path().to_path_buf(),
+        )
+        .expect("monitor");
+        let goal = monitor
+            .create_goal("长期目标", Some(task.id.clone()), true, 60)
+            .expect("goal");
+        monitor
+            .update_progress(
+                &goal.id,
+                Some(vec!["第一步".into()]),
+                Some(vec!["第二步".into()]),
+                None,
+            )
+            .expect("progress");
+        harness
+            .transition(&task.id, TaskStatus::CompletedUnverified)
+            .expect("finish task epoch");
+
+        let refreshed = monitor.refresh_goal(&goal.id, &harness).expect("refresh");
+        assert_eq!(refreshed.status, GoalStatus::Active);
+        assert_eq!(refreshed.health, GoalHealth::Idle);
+        assert!(refreshed.should_continue);
+        assert!(refreshed.needs_attention);
+        assert_eq!(refreshed.pending_steps, vec!["第二步".to_string()]);
+    }
+
+    #[test]
+    fn goal_rebinds_to_new_execution_epoch() {
+        let workspace = tempdir().expect("workspace");
+        let harness_store = tempdir().expect("harness store");
+        let monitor_store = tempdir().expect("monitor store");
+        fs::write(workspace.path().join("main.txt"), "hello\n").expect("workspace file");
+        let harness = Harness::new(workspace.path().to_path_buf(), harness_store.path().to_path_buf())
+            .expect("harness");
+        let first = harness.start_task("长期目标").expect("first task");
+        let monitor = GoalMonitor::new(
+            harness.workspace_id().to_string(),
+            Some("profile".into()),
+            monitor_store.path().to_path_buf(),
+        )
+        .expect("monitor");
+        let goal = monitor
+            .create_goal("长期目标", Some(first.id.clone()), true, 60)
+            .expect("goal");
+        harness
+            .transition(&first.id, TaskStatus::Abandoned)
+            .expect("abandon first");
+        let second = harness.start_task("长期目标").expect("second task");
+        let rebound = monitor.rebind_task(&goal.id, &second.id).expect("rebind");
+        assert_eq!(rebound.task_id.as_deref(), Some(second.id.as_str()));
+        assert_eq!(rebound.task_epochs, vec![first.id, second.id]);
+        assert_eq!(rebound.status, GoalStatus::Active);
+    }
+
+    #[test]
+    fn same_objective_goal_supersedes_old_history_entry() {
+        let store = tempdir().expect("monitor store");
+        let monitor = GoalMonitor::new("workspace", Some("profile".into()), store.path().to_path_buf())
+            .expect("monitor");
+        let first = monitor
+            .create_goal("同一长期目标", Some("task-1".into()), true, 60)
+            .expect("first");
+        monitor
+            .set_status(&first.id, GoalStatus::Completed, None)
+            .expect("complete old");
+        let second = monitor
+            .create_goal("同一长期目标", Some("task-2".into()), true, 60)
+            .expect("second");
+        let old = monitor.goal(&first.id).expect("old goal");
+        assert_eq!(old.superseded_by_goal_id.as_deref(), Some(second.id.as_str()));
     }
 }
 

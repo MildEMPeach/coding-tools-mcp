@@ -39,10 +39,18 @@
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
   const currentItems = $derived(
-    items.filter((item) => !["completed", "failed", "cleared"].includes(item.goal.status)),
+    items.filter(
+      (item) =>
+        !item.goal.superseded_by_goal_id &&
+        !["completed", "failed", "cleared"].includes(item.goal.status),
+    ),
   );
   const historyItems = $derived(
-    items.filter((item) => ["completed", "failed", "cleared"].includes(item.goal.status)),
+    items.filter(
+      (item) =>
+        !item.goal.superseded_by_goal_id &&
+        ["completed", "failed", "cleared"].includes(item.goal.status),
+    ),
   );
   const visibleItems = $derived(
     filter === "current" ? currentItems : filter === "history" ? historyItems : items,
@@ -325,6 +333,9 @@
                     {item.workspace_name}
                   </button>
                   <span class="tx-status-pill px-2 py-0.5 text-[11px]">{statusLabel(item.goal.status)}</span>
+                  {#if item.goal.superseded_by_goal_id}
+                    <span class="tx-status-pill px-2 py-0.5 text-[11px]">已被新 Goal 替代</span>
+                  {/if}
                   <span class={`text-[11px] ${healthClass(item.goal.health)}`}>
                     {healthLabel(item.goal.health)}
                   </span>
@@ -398,6 +409,12 @@
                   <dt class="text-[var(--color-text-muted)]">Task</dt>
                   <dd class="max-w-36 truncate font-mono">{item.goal.task_id ?? "—"}</dd>
                 </div>
+                {#if item.goal.task_epochs.length > 1}
+                  <div class="flex justify-between gap-3">
+                    <dt class="text-[var(--color-text-muted)]">Epochs</dt>
+                    <dd>{item.goal.task_epochs.length}</dd>
+                  </div>
+                {/if}
               </dl>
             </div>
 

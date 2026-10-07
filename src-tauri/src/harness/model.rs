@@ -40,6 +40,7 @@ pub enum TaskStatus {
     Failed,
     Completed,
     CompletedUnverified,
+    Abandoned,
     RolledBack,
 }
 
@@ -57,11 +58,13 @@ impl TaskStatus {
             (Self::Active, Self::Paused | Self::Verifying | Self::Failed)
                 | (Self::Active, Self::CompletedUnverified)
                 | (Self::Paused, Self::Active)
+                | (Self::Paused, Self::Abandoned)
                 | (
                     Self::Verifying,
-                    Self::Completed | Self::CompletedUnverified | Self::Failed
+                    Self::Completed | Self::CompletedUnverified | Self::Failed | Self::Abandoned
                 )
-                | (Self::Failed, Self::Active | Self::RolledBack)
+                | (Self::Failed, Self::Active | Self::RolledBack | Self::Abandoned)
+                | (Self::Active, Self::Abandoned)
         )
     }
 }
@@ -92,6 +95,10 @@ pub struct TaskSession {
     pub status: TaskStatus,
     pub baseline: ProjectBaseline,
     pub expected_fingerprint: String,
+    #[serde(default)]
+    pub expected_baseline: Option<ProjectBaseline>,
+    #[serde(default)]
+    pub ignored_paths: Vec<String>,
     #[serde(default)]
     pub completed_steps: Vec<String>,
     #[serde(default)]

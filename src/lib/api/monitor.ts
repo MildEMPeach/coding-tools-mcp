@@ -17,6 +17,8 @@ export interface GoalRecord {
   workspace_id: string;
   profile_id: string | null;
   task_id: string | null;
+  task_epochs: string[];
+  superseded_by_goal_id: string | null;
   objective: string;
   status: GoalStatus;
   health: GoalHealth;

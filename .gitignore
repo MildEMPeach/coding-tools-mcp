@@ -19,6 +19,12 @@ src-tauri/target
 # MCP Probe 临时图谱快照
 .mcp-probe-kit/graph-snapshots/
 
+# MCP Probe 本地环境、运行记录和缓存
+.mcp-probe-kit/local.env
+.mcp-probe-kit/plans/
+.mcp-probe-kit/reports/
+.mcp-probe-kit/npm-cache/
+
 # 当前桌面版不使用的 Tauri 移动端及中间图标资源
 src-tauri/icons/64x64.png
 src-tauri/icons/android/

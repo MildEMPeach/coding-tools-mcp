@@ -10,6 +10,7 @@ use tokio::process::Command;
 use std::sync::Arc;
 
 use crate::tools::context::ToolContext;
+use crate::harness::Harness;
 use super::command_line::split_command;
 use super::exec_paths::resolve_workdir;
 use super::policy::is_allowlisted_program;
@@ -269,7 +270,12 @@ async fn run_command(
 
     if yield_time.is_zero() {
         let snapshot = session.snapshot(max_output);
-        spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
+        spawn_timeout_monitor(
+            ctx.sessions.clone(),
+            session.clone(),
+            ctx.harness.clone(),
+            deadline,
+        );
         return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
     }
 
@@ -299,7 +305,7 @@ async fn run_command(
         if session.has_exited() {
             session.wait_for_readers().await;
             let snapshot = session.snapshot(max_output);
-            ctx.sessions.remove(&session.session_id);
+            schedule_session_eviction(ctx.sessions.clone(), session.session_id.clone());
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, false));
         }
         if !tty && Instant::now() >= deadline {
@@ -325,7 +331,12 @@ async fn run_command(
         }
         if Instant::now() - start >= yield_time || tty {
             let snapshot = session.snapshot(max_output);
-            spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
+            spawn_timeout_monitor(
+                ctx.sessions.clone(),
+                session.clone(),
+                ctx.harness.clone(),
+                deadline,
+            );
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -333,26 +344,68 @@ async fn run_command(
 }
 
 /// How long a timed-out / background session stays readable before map eviction.
-const SESSION_EVICT_AFTER_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_EVICT_AFTER_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn spawn_timeout_monitor(
     sessions: Arc<SessionStore>,
     session: Arc<ExecSession>,
+    harness: Harness,
     deadline: Instant,
 ) {
     tauri::async_runtime::spawn(async move {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(remaining).await;
-        session.refresh_status().await;
-        if !session.has_exited() {
-            session.mark_termination_reason("timeout");
-            session.kill_and_wait().await;
+        loop {
             session.refresh_status().await;
-            session.wait_for_readers().await;
+            if session.has_exited() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                session.mark_termination_reason("timeout");
+                session.kill_and_wait().await;
+                session.refresh_status().await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        session.wait_for_readers().await;
+        for _ in 0..50 {
+            if session.harness_operation_id().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        record_final_exec_operation(&harness, &session);
         // Keep the session briefly so clients can still read_output / probe status.
         schedule_session_eviction(sessions, session.session_id.clone());
     });
+}
+
+fn record_final_exec_operation(harness: &Harness, session: &ExecSession) {
+    let Some(operation_id) = session.harness_operation_id() else {
+        return;
+    };
+    let snapshot = session.snapshot(65_536);
+    let command_ok = snapshot.get("command_ok").and_then(Value::as_bool);
+    let kind = if command_ok == Some(true) {
+        "completed"
+    } else {
+        "failed"
+    };
+    let task_id = session.harness_task_id();
+    let _ = harness.record_operation(
+        Some(&operation_id),
+        task_id.as_deref(),
+        "exec_command",
+        kind,
+        json!({"session_id": session.session_id}),
+        json!({
+            "ok": command_ok == Some(true),
+            "status": snapshot.get("status"),
+            "termination_reason": snapshot.get("termination_reason"),
+            "exit_code": snapshot.get("exit_code"),
+            "command_ok": snapshot.get("command_ok"),
+            "output_refs": snapshot.get("output_refs")
+        }),
+    );
 }
 
 fn schedule_session_eviction(sessions: Arc<SessionStore>, session_id: String) {

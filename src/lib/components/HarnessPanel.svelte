@@ -52,6 +52,8 @@
         return "已完成";
       case "completed_unverified":
         return "完成（未验证）";
+      case "abandoned":
+        return "已放弃";
       case "rolled_back":
         return "已回滚";
       default:

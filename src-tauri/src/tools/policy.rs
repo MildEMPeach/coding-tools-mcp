@@ -49,6 +49,7 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "clang",
     "gcc",
     "g++",
+    "docker",
     "git",
     "cmd",
     "powershell",

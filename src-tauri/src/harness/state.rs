@@ -23,6 +23,61 @@ pub struct Harness {
     store: HarnessStore,
 }
 
+fn request_key(request_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(request_id.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn diff_baselines(before: &ProjectBaseline, after: &ProjectBaseline) -> Vec<FileChangeRecord> {
+    let before_map = before
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let after_map = after
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut paths = before_map
+        .keys()
+        .chain(after_map.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let before_entry = before_map.get(path).copied();
+            let after_entry = after_map.get(path).copied();
+            match (before_entry, after_entry) {
+                (Some(before), Some(after)) if before.sha256 == after.sha256 => None,
+                (Some(before), Some(after)) => Some(FileChangeRecord {
+                    path: path.to_string(),
+                    status: "modified".into(),
+                    before_sha256: Some(before.sha256.clone()),
+                    after_sha256: Some(after.sha256.clone()),
+                }),
+                (Some(before), None) => Some(FileChangeRecord {
+                    path: path.to_string(),
+                    status: "deleted".into(),
+                    before_sha256: Some(before.sha256.clone()),
+                    after_sha256: None,
+                }),
+                (None, Some(after)) => Some(FileChangeRecord {
+                    path: path.to_string(),
+                    status: "added".into(),
+                    before_sha256: None,
+                    after_sha256: Some(after.sha256.clone()),
+                }),
+                (None, None) => None,
+            }
+        })
+        .collect()
+}
+
 impl Harness {
     pub fn new(workspace_root: PathBuf, harness_root: PathBuf) -> HarnessResult<Self> {
         let workspace_root = workspace_root
@@ -69,6 +124,8 @@ impl Harness {
             objective: objective.trim().to_string(),
             status: TaskStatus::Active,
             expected_fingerprint: baseline.worktree_fingerprint.clone(),
+            expected_baseline: Some(baseline.clone()),
+            ignored_paths: Vec::new(),
             baseline,
             completed_steps: Vec::new(),
             pending_steps: Vec::new(),
@@ -86,6 +143,49 @@ impl Harness {
             json!({}),
             json!({"ok": true}),
         )?;
+        Ok(task)
+    }
+
+    pub fn accept_known_mutation(
+        &self,
+        task_id: &str,
+        tool_name: &str,
+    ) -> HarnessResult<TaskSession> {
+        let mut task = self.task(task_id)?;
+        let before = task
+            .expected_baseline
+            .clone()
+            .unwrap_or_else(|| task.baseline.clone());
+        let current = capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths);
+        if current.branch != task.baseline.branch || current.head != task.baseline.head {
+            return Err(HarnessError::new(
+                "BASELINE_STALE",
+                "工具执行后 Git 分支或 HEAD 已变化，Harness 不会自动接受 Git 基线切换",
+            ));
+        }
+        let affected_files = diff_baselines(&before, &current);
+        task.expected_fingerprint = current.worktree_fingerprint.clone();
+        task.expected_baseline = Some(current);
+        task.updated_at = timestamp();
+        let event_id = Uuid::new_v4().simple().to_string();
+        if !affected_files.is_empty() {
+            task.latest_change_id = Some(event_id.clone());
+        }
+        self.store.save_task(&task)?;
+        let event = HarnessEvent {
+            id: event_id,
+            task_id: task_id.to_string(),
+            operation_id: Uuid::new_v4().simple().to_string(),
+            kind: "known_mutation_accepted".into(),
+            tool_name: Some(tool_name.to_string()),
+            input_summary: json!({"workspace_id": self.workspace_id}),
+            result_summary: json!({"ok": true, "changed_files": affected_files.len()}),
+            reason: None,
+            affected_files,
+            created_at: timestamp(),
+        };
+        self.store
+            .append_event_for_workspace(&self.workspace_id, &event)?;
         Ok(task)
     }
 
@@ -155,14 +255,19 @@ impl Harness {
 
     pub fn check_baseline(&self, task_id: &str) -> HarnessResult<()> {
         let task = self.task(task_id)?;
-        let current = capture_baseline(&self.workspace_root);
+        let current = capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths);
         if current.branch != task.baseline.branch || current.head != task.baseline.head {
             return Err(HarnessError::new(
                 "BASELINE_STALE",
                 "Git 分支或 HEAD 已发生变化",
             ));
         }
-        if current.worktree_fingerprint != task.expected_fingerprint {
+        let expected_fingerprint = task
+            .expected_baseline
+            .as_ref()
+            .map(|baseline| baseline.worktree_fingerprint.as_str())
+            .unwrap_or(task.expected_fingerprint.as_str());
+        if current.worktree_fingerprint != expected_fingerprint {
             return Err(HarnessError::new(
                 "FILE_CHANGED_EXTERNALLY",
                 "工作区存在 Harness 未记录的外部文件变化",
@@ -173,9 +278,75 @@ impl Harness {
 
     pub fn refresh_expected_state(&self, task_id: &str) -> HarnessResult<TaskSession> {
         let mut task = self.task(task_id)?;
-        task.expected_fingerprint = capture_baseline(&self.workspace_root).worktree_fingerprint;
+        let current = capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths);
+        task.expected_fingerprint = current.worktree_fingerprint.clone();
+        task.expected_baseline = Some(current);
         task.updated_at = timestamp();
         self.store.save_task(&task)?;
+        Ok(task)
+    }
+
+    pub fn refresh_baseline(
+        &self,
+        task_id: &str,
+        accept_paths: &[String],
+        ignore_paths: &[String],
+    ) -> HarnessResult<TaskSession> {
+        let mut task = self.task(task_id)?;
+        for path in ignore_paths {
+            let normalized = normalize_rel_path(path);
+            if !normalized.is_empty() && !task.ignored_paths.contains(&normalized) {
+                task.ignored_paths.push(normalized);
+            }
+        }
+        task.ignored_paths.sort();
+        task.ignored_paths.dedup();
+
+        let current = capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths);
+        if current.branch != task.baseline.branch || current.head != task.baseline.head {
+            return Err(HarnessError::new(
+                "BASELINE_STALE",
+                "Git 分支或 HEAD 已发生变化；文件级 refresh_baseline 不会接受 Git 基线变化",
+            ));
+        }
+        let mut expected = task
+            .expected_baseline
+            .clone()
+            .unwrap_or_else(|| task.baseline.clone());
+        expected.entries.retain(|entry| !path_matches_any(&entry.path, &task.ignored_paths));
+        let current_map = current
+            .entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.clone()))
+            .collect::<HashMap<_, _>>();
+        for path in accept_paths {
+            let normalized = normalize_rel_path(path);
+            if normalized.is_empty() {
+                continue;
+            }
+            expected
+                .entries
+                .retain(|entry| !path_matches_prefix(&entry.path, &normalized));
+            for (current_path, entry) in &current_map {
+                if path_matches_prefix(current_path, &normalized) {
+                    expected.entries.push(entry.clone());
+                }
+            }
+        }
+        expected.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        expected.worktree_fingerprint = fingerprint_entries(&expected.entries);
+        expected.captured_at = timestamp();
+        task.expected_fingerprint = expected.worktree_fingerprint.clone();
+        task.expected_baseline = Some(expected);
+        task.updated_at = timestamp();
+        self.store.save_task(&task)?;
+        self.record_event(
+            task_id,
+            "baseline_refreshed",
+            Some("refresh_baseline"),
+            json!({"accept_paths": accept_paths, "ignore_paths": ignore_paths}),
+            json!({"ok": true}),
+        )?;
         Ok(task)
     }
 
@@ -259,13 +430,36 @@ impl Harness {
         self.store.recent_operations(&self.workspace_id, limit)
     }
 
+    pub fn operation_status(&self, operation_id: &str) -> HarnessResult<Option<OperationRecord>> {
+        self.store.find_operation(&self.workspace_id, operation_id)
+    }
+
+    pub fn load_idempotent_result(&self, request_id: &str) -> HarnessResult<Option<serde_json::Value>> {
+        self.store
+            .load_request_result(&self.workspace_id, &request_key(request_id))
+    }
+
+    pub fn save_idempotent_result(
+        &self,
+        request_id: &str,
+        value: &serde_json::Value,
+    ) -> HarnessResult<()> {
+        self.store
+            .save_request_result(&self.workspace_id, &request_key(request_id), value)
+    }
+
     pub fn project_state(&self, max_files: usize) -> HarnessResult<ProjectState> {
-        let current = capture_baseline(&self.workspace_root);
         let task = self.current_task()?;
+        let current = task
+            .as_ref()
+            .map(|task| capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths))
+            .unwrap_or_else(|| capture_baseline(&self.workspace_root));
         let baseline_map = task
             .as_ref()
             .map(|t| {
-                t.baseline
+                t.expected_baseline
+                    .as_ref()
+                    .unwrap_or(&t.baseline)
                     .entries
                     .iter()
                     .map(|e| (e.path.clone(), e))
@@ -354,7 +548,13 @@ impl Harness {
         let task = self.current_task()?;
         // Standalone errors/status need Git metadata, not a snapshot of every
         // file. A home-directory workspace may contain OS-protected media.
-        let current = task.as_ref().filter(|_| verify_baseline).map(|_| capture());
+        let current = task.as_ref().filter(|_| verify_baseline).map(|task| {
+            if task.ignored_paths.is_empty() {
+                capture()
+            } else {
+                capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths)
+            }
+        });
         let (branch, head) = match current.as_ref() {
             Some(current) => (current.branch.clone(), current.head.clone()),
             None => (
@@ -365,9 +565,13 @@ impl Harness {
         let (task_id, task_objective, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
+                    let expected = task.expected_baseline.as_ref();
                     let matches = current.as_ref().map(|current| task.baseline.branch == current.branch
                         && task.baseline.head == current.head
-                        && task.expected_fingerprint == current.worktree_fingerprint);
+                        && expected
+                            .map(|baseline| baseline.worktree_fingerprint.as_str())
+                            .unwrap_or(task.expected_fingerprint.as_str())
+                            == current.worktree_fingerprint);
                     let reason = match matches {
                         Some(true) => "任务可继续执行",
                         Some(false) => "工作区基线已变化，写入和执行已暂停",
@@ -519,8 +723,73 @@ impl Harness {
     }
 }
 
+fn fingerprint_entries(entries: &[BaselineEntry]) -> String {
+    let mut fingerprint = Sha256::new();
+    for entry in entries {
+        fingerprint.update(entry.path.as_bytes());
+        fingerprint.update(entry.sha256.as_bytes());
+        fingerprint.update(entry.bytes.to_le_bytes());
+    }
+    format!("{:x}", fingerprint.finalize())
+}
+
+fn git_visible_paths(root: &Path) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| String::from_utf8_lossy(bytes).replace('\\', "/"))
+            .collect(),
+    )
+}
+
+fn normalize_rel_path(path: &str) -> String {
+    path.trim().trim_start_matches("./").replace('\\', "/")
+}
+
+fn path_matches_any(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| path_matches_prefix(path, pattern))
+}
+
+fn path_matches_prefix(path: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim_end_matches('/');
+    path == pattern || path.starts_with(&format!("{pattern}/"))
+}
+
+fn is_harness_internal_path(path: &str) -> bool {
+    path == "docs/history-session" || path.starts_with("docs/history-session/")
+}
+
 pub fn capture_baseline(root: &Path) -> ProjectBaseline {
+    capture_baseline_with_ignored(root, &[])
+}
+
+fn capture_baseline_with_ignored(root: &Path, ignored_paths: &[String]) -> ProjectBaseline {
     let mut entries = Vec::new();
+    if let Some(paths) = git_visible_paths(root) {
+        for rel in paths {
+            if is_harness_internal_path(&rel) || path_matches_any(&rel, ignored_paths) {
+                continue;
+            }
+            let path = root.join(&rel);
+            if !path.is_file() {
+                continue;
+            }
+            let Some((sha256, is_binary, byte_len)) = hash_file_bounded(&path) else {
+                continue;
+            };
+            entries.push(BaselineEntry { path: rel, exists: true, is_binary, sha256, bytes: byte_len });
+        }
+    } else {
     // Prune skipped directories (OneDrive, node_modules, …) so WalkDir does not
     // descend into them — hashing alone is not enough for home-dir workspaces.
     for item in WalkDir::new(root)
@@ -541,6 +810,9 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
+        if is_harness_internal_path(&rel) || path_matches_any(&rel, ignored_paths) {
+            continue;
+        }
         entries.push(BaselineEntry {
             path: rel,
             exists: true,
@@ -549,17 +821,12 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
             bytes: byte_len,
         });
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut fingerprint = Sha256::new();
-    for entry in &entries {
-        fingerprint.update(entry.path.as_bytes());
-        fingerprint.update(entry.sha256.as_bytes());
-        fingerprint.update(entry.bytes.to_le_bytes());
     }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
     ProjectBaseline {
         branch: git_value(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
         head: git_value(root, &["rev-parse", "HEAD"]),
-        worktree_fingerprint: format!("{:x}", fingerprint.finalize()),
+        worktree_fingerprint: fingerprint_entries(&entries),
         entries,
         captured_at: timestamp(),
     }
@@ -785,5 +1052,75 @@ mod tests {
         assert!(is_skipped_component("onedrive"));
         assert!(is_skipped_component("OneDrive"));
         assert!(is_skipped_component("LIBRARY"));
+    }
+
+    #[test]
+    fn capture_baseline_respects_gitignore_and_excludes_history_session() {
+        let root = tempdir().expect("root");
+        let git = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.path())
+            .output()
+            .expect("git init");
+        assert!(git.status.success());
+        fs::write(root.path().join(".gitignore"), "ignored/\ndocs/history-session/\n").expect("gitignore");
+        fs::write(root.path().join("keep.txt"), "keep\n").expect("keep");
+        fs::create_dir_all(root.path().join("ignored")).expect("ignored dir");
+        fs::write(root.path().join("ignored/generated.txt"), "generated\n").expect("ignored file");
+        fs::create_dir_all(root.path().join("docs/history-session")).expect("history dir");
+        fs::write(root.path().join("docs/history-session/1.md"), "history\n").expect("history");
+
+        let baseline = capture_baseline(root.path());
+        let paths = baseline.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>();
+        assert!(paths.contains(&"keep.txt"));
+        assert!(!paths.iter().any(|path| path.starts_with("ignored/")));
+        assert!(!paths.iter().any(|path| path.starts_with("docs/history-session/")));
+    }
+
+    #[test]
+    fn refresh_baseline_accepts_only_explicit_paths() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness root");
+        fs::write(workspace.path().join("a.txt"), "a0\n").expect("a");
+        fs::write(workspace.path().join("b.txt"), "b0\n").expect("b");
+        let harness = Harness::new(workspace.path().to_path_buf(), harness_root.path().to_path_buf())
+            .expect("harness");
+        let task = harness.start_task("selective baseline").expect("task");
+
+        fs::write(workspace.path().join("a.txt"), "a1\n").expect("a changed");
+        fs::write(workspace.path().join("b.txt"), "b1\n").expect("b changed");
+        assert_eq!(harness.check_baseline(&task.id).unwrap_err().code(), "FILE_CHANGED_EXTERNALLY");
+
+        harness
+            .refresh_baseline(&task.id, &["a.txt".into()], &[])
+            .expect("accept a");
+        assert_eq!(harness.check_baseline(&task.id).unwrap_err().code(), "FILE_CHANGED_EXTERNALLY");
+
+        harness
+            .refresh_baseline(&task.id, &["b.txt".into()], &[])
+            .expect("accept b");
+        harness.check_baseline(&task.id).expect("baseline matches");
+    }
+
+    #[test]
+    fn known_mutation_updates_expected_state_and_records_files() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness root");
+        fs::write(workspace.path().join("lock.txt"), "v1\n").expect("file");
+        let harness = Harness::new(workspace.path().to_path_buf(), harness_root.path().to_path_buf())
+            .expect("harness");
+        let task = harness.start_task("known mutation").expect("task");
+        fs::write(workspace.path().join("lock.txt"), "v2\n").expect("changed");
+
+        harness
+            .accept_known_mutation(&task.id, "exec_command")
+            .expect("accept mutation");
+        harness.check_baseline(&task.id).expect("baseline matches");
+        let events = harness.list_events(&task.id, 0, 20).expect("events");
+        let event = events
+            .iter()
+            .find(|event| event.kind == "known_mutation_accepted")
+            .expect("known mutation event");
+        assert!(event.affected_files.iter().any(|file| file.path == "lock.txt"));
     }
 }

@@ -285,8 +285,8 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 | Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
 | 环境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
 | 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate`、`history_session_search`、`history_session_read` |
-| Harness | `harness_status`、`operation_log`、`project_state`、`start_task`、`update_task`、`finish_task`、`task_context`、`change_summary`、`patch_check` |
-| Goal Monitor | `goal_create`、`goal_status`、`goal_handoff`、`goal_update`、`goal_pause`、`goal_resume`、`goal_block`、`goal_complete`、`goal_clear` |
+| Harness | `harness_status`、`operation_log`、`operation_status`、`project_state`、`start_task`、`update_task`、`refresh_baseline`、`rotate_task`、`abandon_task`、`finish_task`、`task_context`、`change_summary`、`patch_check` |
+| Goal Monitor | `goal_create`、`goal_status`、`goal_handoff`、`goal_update`、`goal_rebind_task`、`goal_pause`、`goal_resume`、`goal_block`、`goal_complete`、`goal_clear` |
 
 典型开发过程：
 

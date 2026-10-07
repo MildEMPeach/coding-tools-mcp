@@ -25,6 +25,186 @@ fn server_info_returns_workspace_and_tools() {
 }
 
 #[test]
+fn mutating_request_id_replays_first_result_and_operation_status_recovers_it() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let patch = "*** Begin Patch\n*** Update File: src/math.js\n@@\n-  return a - b;\n+  return a - b; // idempotent\n*** End Patch";
+    let request_id = "req-apply-patch-once";
+
+    let first = invoke(
+        &ctx,
+        "apply_patch",
+        json!({"patch": patch, "request_id": request_id}),
+    );
+    let first = assert_ok(&first);
+    assert_eq!(first["request_id"], request_id);
+    assert_eq!(first["idempotent_replay"], false);
+
+    let second = invoke(
+        &ctx,
+        "apply_patch",
+        json!({"patch": patch, "request_id": request_id}),
+    );
+    let second = assert_ok(&second);
+    assert_eq!(second["request_id"], request_id);
+    assert_eq!(second["idempotent_replay"], true);
+
+    let status = invoke(
+        &ctx,
+        "operation_status",
+        json!({"request_id": request_id}),
+    );
+    let status = assert_ok(&status);
+    assert_eq!(status["found"], true);
+    assert_eq!(status["result"]["request_id"], request_id);
+    assert_eq!(status["result"]["idempotent_replay"], false);
+
+    let content = fs::read_to_string(fx.root.join("src/math.js")).expect("math.js");
+    assert_eq!(content.matches("// idempotent").count(), 1);
+}
+
+#[test]
+fn completed_exec_session_remains_queryable() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let command = format!("{TEST_PYTHON} -c \"print('session-final')\"");
+    let out = invoke(&ctx, "exec_command", json!({"cmd": command}));
+    let payload = assert_ok(&out);
+    assert_eq!(payload["status"], "exited");
+    let session_id = payload["session_id"].as_str().expect("session_id");
+
+    let probe = invoke(
+        &ctx,
+        "write_stdin",
+        json!({"session_id": session_id, "chars": ""}),
+    );
+    let probe = assert_ok(&probe);
+    assert_eq!(probe["status"], "exited");
+    assert_eq!(probe["exit_code"], 0);
+    assert!(probe["stdout"].as_str().unwrap_or("").contains("session-final"));
+}
+
+#[test]
+fn background_exec_mutation_is_reconciled_before_next_write() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = invoke(
+        &ctx,
+        "start_task",
+        json!({"objective": "track background exec mutation"}),
+    );
+    assert_ok(&task);
+
+    let command = format!(
+        "{TEST_PYTHON} -c \"from pathlib import Path; import time; Path('async-generated.txt').write_text('done'); time.sleep(0.25)\""
+    );
+    let running = invoke(
+        &ctx,
+        "exec_command",
+        json!({"cmd": command, "yield_time_ms": 0, "timeout_ms": 5000}),
+    );
+    let running = assert_ok(&running);
+    assert_eq!(running["status"], "running");
+
+    let while_running = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "patch": "*** Begin Patch\n*** Update File: src/math.js\n@@\n-  return a - b;\n+  return a - b; // after background\n*** End Patch"
+        }),
+    );
+    let while_running = assert_err(&while_running);
+    assert_eq!(while_running["error"]["code"], "EXEC_SESSION_RUNNING");
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after_exit = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "patch": "*** Begin Patch\n*** Update File: src/math.js\n@@\n-  return a - b;\n+  return a - b; // after background\n*** End Patch"
+        }),
+    );
+    assert_ok(&after_exit);
+    assert_eq!(
+        fs::read_to_string(fx.root.join("async-generated.txt")).expect("generated"),
+        "done"
+    );
+
+    let status = invoke(&ctx, "harness_status", json!({}));
+    let status = assert_ok(&status);
+    assert_eq!(status["baseline_matches"], true);
+}
+
+#[test]
+fn background_exec_operation_status_reaches_final_result() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let command = format!(
+        "{TEST_PYTHON} -c \"import time; print('operation-final'); time.sleep(0.2)\""
+    );
+    let running = invoke(
+        &ctx,
+        "exec_command",
+        json!({"cmd": command, "yield_time_ms": 0, "timeout_ms": 5000}),
+    );
+    let running = assert_ok(&running);
+    assert_eq!(running["status"], "running");
+    let operation_id = running["operation_id"].as_str().expect("operation_id");
+
+    let initial = invoke(
+        &ctx,
+        "operation_status",
+        json!({"operation_id": operation_id}),
+    );
+    let initial = assert_ok(&initial);
+    assert_eq!(initial["operation"]["kind"], "running");
+
+    let mut final_status = None;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let candidate = invoke(
+            &ctx,
+            "operation_status",
+            json!({"operation_id": operation_id}),
+        );
+        let candidate = assert_ok(&candidate).clone();
+        if candidate["operation"]["kind"] != "running" {
+            final_status = Some(candidate);
+            break;
+        }
+    }
+    let final_status = final_status.expect("background operation should reach a final state");
+    assert_eq!(final_status["operation"]["kind"], "completed");
+    assert_eq!(final_status["operation"]["result_summary"]["exit_code"], 0);
+    assert_eq!(
+        final_status["operation"]["result_summary"]["command_ok"],
+        true
+    );
+}
+
+#[test]
+fn core_hides_unavailable_permission_elicitation_but_advanced_keeps_it() {
+    let core = list_tools_for_profile("core");
+    assert!(core.iter().all(|tool| tool["name"] != "request_permissions"));
+    let advanced = list_tools_for_profile("advanced");
+    assert!(advanced.iter().any(|tool| tool["name"] == "request_permissions"));
+}
+
+#[test]
+fn mutating_tool_schemas_expose_request_id_for_idempotent_recovery() {
+    let tools = list_tools_for_profile("core");
+    for name in ["goal_create", "apply_patch", "exec_command", "refresh_baseline", "rotate_task"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        assert_eq!(tool["inputSchema"]["properties"]["request_id"]["type"], "string");
+    }
+    let read = tools.iter().find(|tool| tool["name"] == "read_file").expect("read_file");
+    assert!(read["inputSchema"]["properties"].get("request_id").is_none());
+}
+
+#[test]
 fn read_file_happy_path() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
@@ -77,7 +257,7 @@ fn request_permissions_is_unsupported_not_silent_grant() {
 
 #[test]
 fn request_permissions_exposes_public_schema_and_grants_in_dangerous_mode() {
-    let tools = list_tools_for_profile("core");
+    let tools = list_tools_for_profile("advanced");
     let tool = tools
         .iter()
         .find(|tool| tool["name"] == "request_permissions")
@@ -208,7 +388,7 @@ fn core_profile_exposes_history_and_harness_workflows() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 47);
+    assert_eq!(names.len(), 51);
     assert!(names.contains("grep_text"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
@@ -226,6 +406,11 @@ fn core_profile_exposes_history_and_harness_workflows() {
     assert!(names.contains("patch_check"));
     assert!(names.contains("goal_status"));
     assert!(names.contains("goal_handoff"));
+    assert!(names.contains("operation_status"));
+    assert!(names.contains("refresh_baseline"));
+    assert!(names.contains("goal_rebind_task"));
+    assert!(names.contains("abandon_task"));
+    assert!(names.contains("rotate_task"));
     assert!(names.contains("goal_create"));
     assert!(names.contains("goal_update"));
     assert!(names.contains("goal_pause"));

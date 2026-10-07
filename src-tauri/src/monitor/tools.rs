@@ -10,6 +10,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "goal_handoff",
     "goal_create",
     "goal_update",
+    "goal_rebind_task",
     "goal_pause",
     "goal_resume",
     "goal_block",
@@ -23,6 +24,7 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
         "goal_handoff" => goal_handoff(ctx, args),
         "goal_create" => goal_create(ctx, args),
         "goal_update" => goal_update(ctx, args),
+        "goal_rebind_task" => goal_rebind_task(ctx, args),
         "goal_pause" => goal_pause(ctx, args),
         "goal_resume" => goal_resume(ctx, args),
         "goal_block" => goal_block(ctx, args),
@@ -31,6 +33,45 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
         _ => Err(tool_error("INVALID_ARGUMENT", "未知 Goal 工具")),
     }?;
     Ok(tool_ok(value))
+}
+
+fn goal_rebind_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let goal_id = resolve_goal_id(ctx, args)?;
+    let current_goal = ctx.monitor.goal(&goal_id).map_err(map_error)?;
+    let task = if let Some(task_id) = args.get("new_task_id").and_then(Value::as_str) {
+        let task = ctx.harness.task(task_id).map_err(map_harness_error)?;
+        if !task.status.is_writable() {
+            return Err(tool_error(
+                "TASK_NOT_WRITABLE",
+                "new_task_id 必须指向可继续工作的 Harness Task",
+            ));
+        }
+        task
+    } else {
+        if let Some(task) = ctx.harness.current_task().map_err(map_harness_error)? {
+            if task.objective.trim() != current_goal.objective.trim() {
+                return Err(tool_error(
+                    "TASK_OBJECTIVE_MISMATCH",
+                    "当前活动 Harness Task 属于另一个目标；请显式提供 new_task_id 或先处理该 Task",
+                ));
+            }
+            task
+        } else {
+            ctx.harness
+                .start_task(&current_goal.objective)
+                .map_err(map_harness_error)?
+        }
+    };
+    let goal = ctx
+        .monitor
+        .rebind_task(&goal_id, &task.id)
+        .map_err(map_error)?;
+    let _ = ctx.harness.update_steps(
+        &task.id,
+        Some(goal.completed_steps.clone()),
+        Some(goal.pending_steps.clone()),
+    );
+    Ok(json!({"goal": goal, "task": task, "should_continue": true}))
 }
 
 fn goal_status(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -110,6 +151,31 @@ fn goal_create(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         .and_then(Value::as_u64)
         .unwrap_or(180)
         .clamp(30, 86_400);
+
+    if let Some(existing) = ctx.monitor.current_goal().map_err(map_error)? {
+        if existing.objective.trim() == objective.trim() {
+            let existing = ctx
+                .monitor
+                .refresh_goal(&existing.id, &ctx.harness)
+                .map_err(map_error)?;
+            let task_id = existing.task_id.clone();
+            let should_continue = existing.should_continue;
+            return Ok(json!({
+                "goal": existing,
+                "task_id": task_id,
+                "should_continue": should_continue,
+                "reused": true,
+                "next": ["goal_status", "continue working"]
+            }));
+        }
+        return Err(tool_error(
+            "GOAL_ALREADY_ACTIVE",
+            format!(
+                "当前工作区已有不同的活动 Goal：{}。请先完成、清除或处理该 Goal",
+                existing.objective
+            ),
+        ));
+    }
 
     let task = match ctx.harness.current_task().map_err(map_harness_error)? {
         Some(task) => {
@@ -216,7 +282,7 @@ fn goal_pause(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
 
 fn goal_resume(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let goal_id = resolve_goal_id(ctx, args)?;
-    let goal = ctx
+    let mut goal = ctx
         .monitor
         .set_status(&goal_id, GoalStatus::Active, None)
         .map_err(map_error)?;
@@ -224,6 +290,20 @@ fn goal_resume(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         if let Ok(task) = ctx.harness.task(task_id) {
             if matches!(task.status, TaskStatus::Paused | TaskStatus::Failed) {
                 let _ = ctx.harness.transition(task_id, TaskStatus::Active);
+            } else if !task.status.is_writable() {
+                let next = ctx
+                    .harness
+                    .start_task(&goal.objective)
+                    .map_err(map_harness_error)?;
+                let _ = ctx.harness.update_steps(
+                    &next.id,
+                    Some(goal.completed_steps.clone()),
+                    Some(goal.pending_steps.clone()),
+                );
+                goal = ctx
+                    .monitor
+                    .rebind_task(&goal.id, &next.id)
+                    .map_err(map_error)?;
             }
         }
     }
@@ -470,6 +550,30 @@ mod tests {
         .expect("complete");
         assert_eq!(completed["goal"]["status"], "completed");
         assert_eq!(ctx.harness.task(task_id).expect("task").status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn repeated_goal_create_reuses_same_active_goal() {
+        let (_workspace, _harness_root, ctx) = context();
+        let first = call(
+            &ctx,
+            "goal_create",
+            &json!({"objective": "持续完成项目"}),
+        )
+        .expect("first create");
+        let first_id = first["goal"]["id"].as_str().expect("goal id").to_string();
+        let first_task = first["task_id"].as_str().expect("task id").to_string();
+
+        let second = call(
+            &ctx,
+            "goal_create",
+            &json!({"objective": "持续完成项目"}),
+        )
+        .expect("retry create");
+        assert_eq!(second["reused"], true);
+        assert_eq!(second["goal"]["id"], first_id);
+        assert_eq!(second["task_id"], first_task);
+        assert_eq!(ctx.monitor.list_goals().expect("goals").len(), 1);
     }
 }
 

@@ -231,7 +231,7 @@ fn default_permission_mode() -> String {
 }
 
 fn default_allowed_commands() -> String {
-    "pytest,python,python3,npm,npx,node,pnpm,yarn,make,mvn,mvnw,gradle,gradlew,cargo,go,ruff,mypy,eslint,tsc,git,cmd,powershell,pwsh".to_string()
+    "pytest,python,python3,npm,npx,node,pnpm,yarn,make,mvn,mvnw,gradle,gradlew,cargo,go,ruff,mypy,eslint,tsc,docker,git,cmd,powershell,pwsh".to_string()
 }
 
 fn default_workspace_local_entries() -> bool {

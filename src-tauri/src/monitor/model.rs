@@ -55,6 +55,10 @@ pub struct GoalRecord {
     pub workspace_id: String,
     pub profile_id: Option<String>,
     pub task_id: Option<String>,
+    #[serde(default)]
+    pub task_epochs: Vec<String>,
+    #[serde(default)]
+    pub superseded_by_goal_id: Option<String>,
     pub objective: String,
     pub status: GoalStatus,
     pub health: GoalHealth,

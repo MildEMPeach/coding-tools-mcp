@@ -51,10 +51,64 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
+fn reconcile_completed_exec_sessions(ctx: &ToolContext, task_id: &str) -> Result<(), Value> {
+    let sessions = ctx
+        .sessions
+        .for_harness_task(task_id)
+        .into_iter()
+        .filter(|session| !session.harness_reconciled())
+        .collect::<Vec<_>>();
+    if sessions.is_empty() {
+        return Ok(());
+    }
+
+    let mut running = Vec::new();
+    for session in &sessions {
+        tauri::async_runtime::block_on(session.refresh_status());
+        if !session.has_exited() {
+            running.push(session.session_id.clone());
+        }
+    }
+    if !running.is_empty() {
+        return Err(tool_err_code(
+            "EXEC_SESSION_RUNNING",
+            format!(
+                "Harness Task 仍有 exec_command session 在运行：{}。请先等待命令结束，再进行新的写操作。",
+                running.join(", ")
+            ),
+            "runtime",
+        ));
+    }
+
+    if let Err(error) = ctx.harness.accept_known_mutation(task_id, "exec_command") {
+        return Err(tool_err_code(error.code(), error.to_string(), "permission"));
+    }
+    for session in sessions {
+        session.mark_harness_reconciled();
+    }
+    Ok(())
+}
+
 /// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
 /// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     let effective_args = apply_default_cwd(ctx, name, args);
+    let request_id = effective_args
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let idempotent_mutation = crate::tools::registry::MUTATING_TOOLS.contains(&name);
+    if idempotent_mutation {
+        if let Some(request_id) = request_id {
+            if let Ok(Some(mut cached)) = ctx.harness.load_idempotent_result(request_id) {
+                if let Some(object) = cached.as_object_mut() {
+                    object.insert("idempotent_replay".into(), Value::Bool(true));
+                    object.insert("request_id".into(), Value::String(request_id.to_string()));
+                }
+                return cached;
+            }
+        }
+    }
     if let Err(e) = validate_tool_arguments_for_workspace(
         name,
         &effective_args,
@@ -64,23 +118,42 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         return policy_tool_err(e);
     }
 
+    if name == "history_session_checkpoint" {
+        if let Ok(Some(task)) = ctx.harness.current_task() {
+            let history_dir = effective_args
+                .get("history_dir")
+                .and_then(Value::as_str)
+                .unwrap_or("docs/history-session");
+            let _ = ctx
+                .harness
+                .refresh_baseline(&task.id, &[], &[history_dir.to_string()]);
+        }
+    }
+
     if crate::harness::tools::TOOL_NAMES.contains(&name) {
-        return match crate::harness::tools::call(ctx, name, args) {
+        let mut output = match crate::harness::tools::call(ctx, name, args) {
             Ok(value) => value,
             Err(error) => attach_harness_status(ctx, tool_err(error), false),
         };
+        persist_idempotent_result(ctx, request_id, idempotent_mutation, &mut output);
+        return output;
     }
 
     if crate::monitor::tools::TOOL_NAMES.contains(&name) {
-        return match crate::monitor::tools::call(ctx, name, args) {
+        let mut output = match crate::monitor::tools::call(ctx, name, args) {
             Ok(value) => value,
             Err(error) => attach_harness_status(ctx, tool_err(error), false),
         };
+        persist_idempotent_result(ctx, request_id, idempotent_mutation, &mut output);
+        return output;
     }
 
     let task_id = if requires_write_baseline(name, &effective_args) {
         let task = ctx.harness.current_task().ok().flatten();
         if let Some(task) = task {
+            if let Err(output) = reconcile_completed_exec_sessions(ctx, &task.id) {
+                return attach_harness_status(ctx, output, false);
+            }
             if let Err(error) = ctx.harness.check_baseline(&task.id) {
                 return attach_harness_status(
                     ctx,
@@ -208,6 +281,18 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         if let Some(object) = output.as_object_mut() {
             object.insert("operation_id".into(), Value::String(operation.id.clone()));
         }
+        if name == "exec_command"
+            && output.get("status").and_then(Value::as_str) == Some("running")
+        {
+            if let Some(session_id) = output.get("session_id").and_then(Value::as_str) {
+                if let Ok(session) = ctx.sessions.get(session_id) {
+                    session.set_harness_operation_id(operation.id.clone());
+                    if let Some(task_id) = task_id.as_deref() {
+                        session.set_harness_task_id(task_id.to_string());
+                    }
+                }
+            }
+        }
     }
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
         output = attach_harness_status(ctx, output, task_id.is_none());
@@ -221,27 +306,82 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
             operation_input(args),
             json!({"ok": succeeded, "tool": name}),
         );
-        if succeeded {
-            let _ = ctx.harness.refresh_expected_state(task_id);
+        if name == "exec_command" {
+            let status = output.get("status").and_then(Value::as_str).unwrap_or("");
+            if status != "running" && status != "spawn_failed" {
+                let _ = ctx.harness.accept_known_mutation(task_id, name);
+            }
+        } else if succeeded {
+            let _ = ctx.harness.accept_known_mutation(task_id, name);
+        }
+    }
+
+    if matches!(name, "write_stdin" | "read_output" | "kill_session") {
+        if let Some(session_id) = output.get("session_id").and_then(Value::as_str) {
+            if output.get("status").and_then(Value::as_str) != Some("running") {
+                if let Ok(session) = ctx.sessions.get(session_id) {
+                    if let Some(task_id) = session.harness_task_id() {
+                        if ctx
+                            .harness
+                            .accept_known_mutation(&task_id, "exec_command")
+                            .is_ok()
+                        {
+                            session.mark_harness_reconciled();
+                        }
+                    }
+                }
+            }
         }
     }
     if let Some(operation) = operation {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
+        let running = name == "exec_command"
+            && output.get("status").and_then(Value::as_str) == Some("running");
         let _ = ctx.harness.record_operation(
             Some(&operation.id),
             task_id.as_deref(),
             name,
-            if succeeded { "completed" } else { "failed" },
+            if running {
+                "running"
+            } else if succeeded {
+                "completed"
+            } else {
+                "failed"
+            },
             operation_input(args),
             json!({
                 "ok": succeeded,
                 "tool": name,
+                "status": output.get("status"),
+                "session_id": output.get("session_id"),
+                "exit_code": output.get("exit_code"),
+                "output_refs": output.get("output_refs"),
                 "affected_files": output.get("affected_files")
             }),
         );
         let _ = ctx.monitor.touch_task(task_id.as_deref());
     }
+    persist_idempotent_result(ctx, request_id, idempotent_mutation, &mut output);
     output
+}
+
+fn persist_idempotent_result(
+    ctx: &ToolContext,
+    request_id: Option<&str>,
+    enabled: bool,
+    output: &mut Value,
+) {
+    if !enabled {
+        return;
+    }
+    let Some(request_id) = request_id else {
+        return;
+    };
+    if let Some(object) = output.as_object_mut() {
+        object.insert("request_id".into(), Value::String(request_id.to_string()));
+        object.insert("idempotent_replay".into(), Value::Bool(false));
+    }
+    let _ = ctx.harness.save_idempotent_result(request_id, output);
 }
 
 // 审计包装紧贴唯一 dispatcher：执行前固化补全默认 cwd 后的实际参数，用单调时钟计时，

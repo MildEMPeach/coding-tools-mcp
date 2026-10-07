@@ -52,6 +52,16 @@ impl SessionStore {
             .expect("sessions lock")
             .remove(session_id);
     }
+
+    pub fn for_harness_task(&self, task_id: &str) -> Vec<Arc<ExecSession>> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .values()
+            .filter(|session| session.harness_task_id().as_deref() == Some(task_id))
+            .cloned()
+            .collect()
+    }
 }
 
 pub struct ExecSession {
@@ -68,6 +78,9 @@ pub struct ExecSession {
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
     termination_reason: Mutex<Option<String>>,
+    harness_task_id: Mutex<Option<String>>,
+    harness_operation_id: Mutex<Option<String>>,
+    harness_reconciled: AtomicBool,
     reader_tasks: AsyncMutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
 }
 
@@ -94,8 +107,44 @@ impl ExecSession {
             exit_code: Mutex::new(None),
             exited: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
+            harness_task_id: Mutex::new(None),
+            harness_operation_id: Mutex::new(None),
+            harness_reconciled: AtomicBool::new(false),
             reader_tasks: AsyncMutex::new(Vec::new()),
         }
+    }
+
+    pub fn set_harness_task_id(&self, task_id: impl Into<String>) {
+        *self.harness_task_id.lock().expect("harness_task_id lock") = Some(task_id.into());
+    }
+
+    pub fn harness_task_id(&self) -> Option<String> {
+        self.harness_task_id
+            .lock()
+            .expect("harness_task_id lock")
+            .clone()
+    }
+
+    pub fn set_harness_operation_id(&self, operation_id: impl Into<String>) {
+        *self
+            .harness_operation_id
+            .lock()
+            .expect("harness_operation_id lock") = Some(operation_id.into());
+    }
+
+    pub fn harness_operation_id(&self) -> Option<String> {
+        self.harness_operation_id
+            .lock()
+            .expect("harness_operation_id lock")
+            .clone()
+    }
+
+    pub fn harness_reconciled(&self) -> bool {
+        self.harness_reconciled.load(Ordering::Acquire)
+    }
+
+    pub fn mark_harness_reconciled(&self) {
+        self.harness_reconciled.store(true, Ordering::Release);
     }
 
     pub async fn spawn_readers(self: &Arc<Self>) {
@@ -433,8 +482,6 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
     let running = tauri::async_runtime::block_on(session.is_running());
     let mut killed = false;
     let mut status = "exited";
-    let mut evicted = true;
-
     if running {
         session.mark_termination_reason("killed");
         tauri::async_runtime::block_on(async {
@@ -457,7 +504,6 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
         tauri::async_runtime::block_on(session.refresh_status());
         if tauri::async_runtime::block_on(session.is_running()) {
             status = "terminating";
-            evicted = false;
         } else {
             killed = true;
             status = "killed";
@@ -468,17 +514,14 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("killed".into(), json!(killed));
         obj.insert("status".into(), json!(status));
-        obj.insert("evicted".into(), json!(evicted));
+        obj.insert("evicted".into(), json!(false));
+        obj.insert("retained".into(), json!(true));
         if status == "terminating" {
             obj.insert(
                 "warnings".into(),
                 json!(["Process did not exit after kill; session retained for retry"]),
             );
         }
-    }
-
-    if evicted {
-        store.remove(session_id);
     }
 
     Ok(tool_ok(payload))

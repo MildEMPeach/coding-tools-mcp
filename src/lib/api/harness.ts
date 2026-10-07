@@ -7,6 +7,7 @@ export type HarnessTaskStatus =
   | "failed"
   | "completed"
   | "completed_unverified"
+  | "abandoned"
   | "rolled_back";
 
 export interface HarnessCapability {

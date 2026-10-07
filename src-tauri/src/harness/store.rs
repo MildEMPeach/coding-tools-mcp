@@ -3,6 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 use super::model::{HarnessEvent, OperationRecord, TaskSession, WorkspaceHarnessState};
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +59,10 @@ impl HarnessStore {
 
     fn operations_path(&self, workspace_id: &str) -> PathBuf {
         self.workspace_dir(workspace_id).join("operations.jsonl")
+    }
+
+    fn requests_dir(&self, workspace_id: &str) -> PathBuf {
+        self.workspace_dir(workspace_id).join("requests")
     }
 
     pub fn save_task(&self, task: &TaskSession) -> HarnessResult<()> {
@@ -179,6 +185,52 @@ impl HarnessStore {
             recent.push_back(operation);
         }
         Ok(recent.into_iter().rev().collect())
+    }
+
+    pub fn find_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> HarnessResult<Option<OperationRecord>> {
+        let path = self.operations_path(workspace_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = File::open(path).map_err(io_error)?;
+        let mut found = None;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(io_error)?;
+            let Ok(operation) = serde_json::from_str::<OperationRecord>(&line) else {
+                continue;
+            };
+            if operation.id == operation_id {
+                found = Some(operation);
+            }
+        }
+        Ok(found)
+    }
+
+    pub fn save_request_result(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        value: &Value,
+    ) -> HarnessResult<()> {
+        let dir = self.requests_dir(workspace_id);
+        fs::create_dir_all(&dir).map_err(io_error)?;
+        atomic_write_json(&dir.join(format!("{key}.json")), value)
+    }
+
+    pub fn load_request_result(
+        &self,
+        workspace_id: &str,
+        key: &str,
+    ) -> HarnessResult<Option<Value>> {
+        let path = self.requests_dir(workspace_id).join(format!("{key}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
     }
 
     pub fn list_events(

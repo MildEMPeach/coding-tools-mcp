@@ -9,12 +9,16 @@ use super::store::HarnessError;
 pub const TOOL_NAMES: &[&str] = &[
     "harness_status",
     "operation_log",
+    "operation_status",
     "project_state",
     "start_task",
     "update_task",
     "pause_task",
     "resume_task",
     "finish_task",
+    "refresh_baseline",
+    "abandon_task",
+    "rotate_task",
     "task_context",
     "list_task_events",
     "change_summary",
@@ -24,18 +28,103 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
     let value = match name {
         "harness_status" => harness_status(ctx),
         "operation_log" => operation_log(ctx, args),
+        "operation_status" => operation_status(ctx, args),
         "project_state" => project_state(ctx, args),
         "start_task" => start_task(ctx, args),
         "update_task" => update_task(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
         "resume_task" => transition(ctx, args, TaskStatus::Active),
         "finish_task" => finish_task(ctx, args),
+        "refresh_baseline" => refresh_baseline(ctx, args),
+        "abandon_task" => transition(ctx, args, TaskStatus::Abandoned),
+        "rotate_task" => rotate_task(ctx, args),
         "task_context" => task_context(ctx, args),
         "list_task_events" => list_task_events(ctx, args),
         "change_summary" => change_summary(ctx, args),
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
     Ok(tool_ok(value))
+}
+
+fn operation_status(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    if let Some(request_id) = args.get("request_id").and_then(Value::as_str) {
+        let result = ctx
+            .harness
+            .load_idempotent_result(request_id)
+            .map_err(map_error)?;
+        return Ok(json!({
+            "request_id": request_id,
+            "found": result.is_some(),
+            "result": result
+        }));
+    }
+    let operation_id = args
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "operation_id 或 request_id 至少提供一个"))?;
+    let operation = ctx
+        .harness
+        .operation_status(operation_id)
+        .map_err(map_error)?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "found": operation.is_some(),
+        "operation": operation
+    }))
+}
+
+fn rotate_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let current = ctx.harness.task(task_id).map_err(map_error)?;
+    if !current.status.is_writable() {
+        return Err(tool_error("TASK_NOT_WRITABLE", "只有活动/暂停/失败/验证中的 Task 可以轮换"));
+    }
+    let objective = args
+        .get("objective")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&current.objective)
+        .to_string();
+    let previous = ctx
+        .harness
+        .transition(task_id, TaskStatus::Abandoned)
+        .map_err(map_error)?;
+    let next = ctx.harness.start_task(&objective).map_err(map_error)?;
+    let next = ctx
+        .harness
+        .update_steps(
+            &next.id,
+            Some(current.completed_steps.clone()),
+            Some(current.pending_steps.clone()),
+        )
+        .map_err(map_error)?;
+    Ok(json!({
+        "previous_task": previous,
+        "task": next,
+        "next": ["goal_rebind_task", "task_context"]
+    }))
+}
+
+fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let accept_paths = string_list(args.get("accept_paths"))?.unwrap_or_default();
+    let ignore_paths = string_list(args.get("ignore_paths"))?.unwrap_or_default();
+    if accept_paths.is_empty() && ignore_paths.is_empty() {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            "refresh_baseline 至少需要 accept_paths 或 ignore_paths；不会隐式接受全部变化",
+        ));
+    }
+    let task = ctx
+        .harness
+        .refresh_baseline(task_id, &accept_paths, &ignore_paths)
+        .map_err(map_error)?;
+    Ok(json!({
+        "task": task,
+        "accepted_paths": accept_paths,
+        "ignored_paths": ignore_paths,
+        "next": ["harness_status", "project_state"]
+    }))
 }
 
 fn harness_status(ctx: &ToolContext) -> Result<Value, WorkspaceError> {

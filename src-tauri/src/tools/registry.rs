@@ -10,6 +10,46 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "operation_status",
+        "Operation status",
+        "Recover the latest operation state by operation_id or the cached idempotent result by request_id after a client timeout.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "abandon_task",
+        "Abandon task",
+        "End a Harness Task without completion semantics so recovery can start a fresh execution epoch.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "rotate_task",
+        "Rotate task",
+        "Abandon the current Harness Task and start a new execution epoch carrying forward task steps.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "goal_rebind_task",
+        "Rebind goal task",
+        "Bind an active Goal to another writable Harness Task, or create a fresh execution epoch when no task_id is supplied.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "refresh_baseline",
+        "Refresh task baseline",
+        "Explicitly accept selected workspace changes or ignore selected paths for the active Harness Task. Never accepts all changes implicitly.",
+        false,
+        false,
+        false,
+    ),
+    (
         "goal_handoff",
         "Continue goal in ChatGPT",
         "Use only as the final Goal tool call when an active Goal is still incomplete. Render a Goal UI that can request a ChatGPT follow-up message to continue the same Goal.",
@@ -393,6 +433,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "goal_handoff",
     "goal_create",
     "goal_update",
+    "goal_rebind_task",
     "goal_pause",
     "goal_resume",
     "goal_block",
@@ -400,6 +441,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "goal_clear",
     "harness_status",
     "operation_log",
+    "operation_status",
     "server_info",
     "history_session_bootstrap",
     "history_session_checkpoint",
@@ -431,10 +473,12 @@ pub const CORE_TOOLS: &[&str] = &[
     "pause_task",
     "resume_task",
     "finish_task",
+    "refresh_baseline",
+    "abandon_task",
+    "rotate_task",
     "task_context",
     "list_task_events",
     "change_summary",
-    "request_permissions",
     "view_image",
 ];
 
@@ -442,6 +486,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "goal_status",
     "harness_status",
     "operation_log",
+    "operation_status",
     "server_info",
     "check_exec_environment",
     "get_default_cwd",
@@ -462,7 +507,6 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "task_context",
     "list_task_events",
     "change_summary",
-    "request_permissions",
     "view_image",
 ];
 
@@ -471,6 +515,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "goal_handoff",
     "goal_create",
     "goal_update",
+    "goal_rebind_task",
     "goal_pause",
     "goal_resume",
     "goal_block",
@@ -478,6 +523,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "goal_clear",
     "harness_status",
     "operation_log",
+    "operation_status",
     "server_info",
     "history_session_bootstrap",
     "history_session_checkpoint",
@@ -511,6 +557,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "pause_task",
     "resume_task",
     "finish_task",
+    "refresh_baseline",
+    "abandon_task",
+    "rotate_task",
     "task_context",
     "list_task_events",
     "change_summary",
@@ -522,6 +571,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "goal_handoff",
     "goal_create",
     "goal_update",
+    "goal_rebind_task",
     "goal_pause",
     "goal_resume",
     "goal_block",
@@ -540,12 +590,16 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "pause_task",
     "resume_task",
     "finish_task",
+    "refresh_baseline",
+    "abandon_task",
+    "rotate_task",
 ];
 
 pub const READ_ONLY_TOOLS: &[&str] = &[
     "goal_status",
     "harness_status",
     "operation_log",
+    "operation_status",
     "server_info",
     "history_session_search",
     "history_session_read",
@@ -617,11 +671,28 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                 } else {
                     (read_only, destructive, open_world)
                 };
+                let mut schema = input_schema(name);
+                if !read_only {
+                    if let Some(properties) = schema
+                        .get_mut("properties")
+                        .and_then(Value::as_object_mut)
+                    {
+                        properties.insert(
+                            "request_id".into(),
+                            json!({
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "description": "Optional idempotency key. Reusing the same request_id replays the first stored result instead of executing the mutation again."
+                            }),
+                        );
+                    }
+                }
                 let mut descriptor = json!({
                     "name": name,
                     "title": title,
                     "description": description,
-                    "inputSchema": input_schema(name),
+                    "inputSchema": schema,
                     "annotations": {
                         "title": title,
                         "readOnlyHint": read_only,
@@ -656,6 +727,47 @@ pub fn input_schema(name: &str) -> Value {
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "create_if_missing": { "type": "boolean", "default": true }
             },
+            "additionalProperties": false
+        }),
+        "operation_status" => json!({
+            "type": "object",
+            "properties": {
+                "operation_id": { "type": "string", "minLength": 1 },
+                "request_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "additionalProperties": false
+        }),
+        "abandon_task" => json!({
+            "type": "object",
+            "properties": { "task_id": { "type": "string", "minLength": 1 } },
+            "required": ["task_id"],
+            "additionalProperties": false
+        }),
+        "rotate_task" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "objective": { "type": "string", "minLength": 1 }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        }),
+        "goal_rebind_task" => json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string", "minLength": 1 },
+                "new_task_id": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+        }),
+        "refresh_baseline" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "accept_paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [] },
+                "ignore_paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [] }
+            },
+            "required": ["task_id"],
             "additionalProperties": false
         }),
         "history_session_checkpoint" => json!({
@@ -1113,7 +1225,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile};
 
     #[test]
-    fn core_catalog_exposes_47_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_51_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -1121,7 +1233,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 47);
+        assert_eq!(tools.len(), 51);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
@@ -1130,9 +1242,14 @@ mod tests {
         assert!(names.contains(&"history_session_read"));
         assert!(names.contains(&"grep_text"));
         assert!(names.contains(&"goal_status"));
+        assert!(names.contains(&"operation_status"));
         assert!(names.contains(&"goal_handoff"));
+        assert!(names.contains(&"refresh_baseline"));
+        assert!(names.contains(&"abandon_task"));
+        assert!(names.contains(&"rotate_task"));
         assert!(names.contains(&"goal_create"));
         assert!(names.contains(&"goal_update"));
+        assert!(names.contains(&"goal_rebind_task"));
         assert!(names.contains(&"goal_pause"));
         assert!(names.contains(&"goal_resume"));
         assert!(names.contains(&"goal_block"));
