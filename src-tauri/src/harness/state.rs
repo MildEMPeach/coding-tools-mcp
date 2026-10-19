@@ -832,15 +832,33 @@ fn capture_baseline_with_ignored(root: &Path, ignored_paths: &[String]) -> Proje
     }
 }
 
+/// Files larger than this threshold are treated as data/artifacts: content
+/// hashing is skipped and a size-only fingerprint is recorded instead. Without
+/// this, a workspace containing large captures, datasets, or build outputs is
+/// re-hashed in full on every write-tool call, pinning all CPU cores. Source
+/// files are essentially always below 1 MiB, so change detection is unaffected
+/// in practice.
+const MAX_CONTENT_HASH_BYTES: u64 = 1024 * 1024;
+
 /// Stream a file in fixed 64 KiB chunks: O(buffer) memory regardless of file
 /// size, so a multi-GB file inside a large workspace cannot spike RSS during
 /// baseline capture. Returns (sha256, is_binary, total_bytes).
 fn hash_file_bounded(path: &Path) -> Option<(String, bool, u64)> {
     use std::io::Read;
+
+    let total = fs::metadata(path).ok()?.len();
+    if total > MAX_CONTENT_HASH_BYTES {
+        // Large file (capture/dataset/artifact): don't read the body. Record a
+        // size-only fingerprint so size changes are still detected while the
+        // expensive content hash is skipped. Marked binary since oversized
+        // files are almost always binary data.
+        return Some((format!("size:{total}"), true, total));
+    }
+
     let mut file = fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
     let mut is_binary = false;
-    let mut total: u64 = 0;
+    let mut total_read: u64 = 0;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buf).ok()?;
@@ -852,9 +870,9 @@ fn hash_file_bounded(path: &Path) -> Option<(String, bool, u64)> {
             is_binary = true;
         }
         hasher.update(chunk);
-        total += read as u64;
+        total_read += read as u64;
     }
-    Some((format!("{:x}", hasher.finalize()), is_binary, total))
+    Some((format!("{:x}", hasher.finalize()), is_binary, total_read))
 }
 
 fn should_skip(path: &Path, root: &Path) -> bool {
@@ -883,6 +901,8 @@ fn is_skipped_component(name: &str) -> bool {
             | ".next"
             | ".turbo"
             | "coverage"
+            | "output"
+            | "out"
     ) {
         return true;
     }
@@ -1052,6 +1072,37 @@ mod tests {
         assert!(is_skipped_component("onedrive"));
         assert!(is_skipped_component("OneDrive"));
         assert!(is_skipped_component("LIBRARY"));
+        assert!(is_skipped_component("output"));
+    }
+
+    #[test]
+    fn capture_baseline_skips_content_hashing_for_large_files() {
+        let root = tempdir().expect("root");
+        fs::write(root.path().join("small.txt"), "tiny\n").expect("small");
+        let large_len = MAX_CONTENT_HASH_BYTES + 1;
+        fs::write(
+            root.path().join("large.bin"),
+            vec![0u8; large_len as usize],
+        )
+        .expect("large");
+
+        let baseline = capture_baseline(root.path());
+        let small = baseline
+            .entries
+            .iter()
+            .find(|e| e.path == "small.txt")
+            .expect("small entry");
+        let large = baseline
+            .entries
+            .iter()
+            .find(|e| e.path == "large.bin")
+            .expect("large entry");
+        // Small files keep a real 64-hex content hash.
+        assert_eq!(small.sha256.len(), 64);
+        // Large files get a size-only fingerprint and are marked binary.
+        assert_eq!(large.sha256, format!("size:{large_len}"));
+        assert!(large.is_binary);
+        assert_eq!(large.bytes, large_len);
     }
 
     #[test]
