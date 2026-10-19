@@ -78,8 +78,19 @@ pub struct BaselineEntry {
     pub bytes: u64,
 }
 
+/// 基线内容哈希口径版本。v1 对全部文件做全量 SHA-256；v2 对超过 1 MiB 的文件
+/// 改用 size 指纹（见 harness::state::MAX_CONTENT_HASH_BYTES）。旧任务载入时若版本
+/// 低于当前值，Harness 会透明重算一次基线，避免口径升级把旧任务永久锁死。
+pub const CURRENT_HASH_VERSION: u32 = 2;
+
+fn default_hash_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectBaseline {
+    #[serde(default = "default_hash_version")]
+    pub hash_version: u32,
     pub branch: Option<String>,
     pub head: Option<String>,
     pub worktree_fingerprint: String,

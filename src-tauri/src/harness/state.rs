@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 use super::model::{
     BaselineEntry, CapabilityStatus, FileChangeRecord, HarnessEvent, HarnessStatus, OperationRecord,
     ProjectBaseline, ProjectFileState, ProjectState, TaskSession,
-    TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
+    TaskStatus, WorkspaceHarnessState, CURRENT_HASH_VERSION, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
 
@@ -151,7 +151,7 @@ impl Harness {
         task_id: &str,
         tool_name: &str,
     ) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
+        let mut task = self.migrate_stale_baseline(self.task(task_id)?)?;
         let before = task
             .expected_baseline
             .clone()
@@ -254,7 +254,7 @@ impl Harness {
     }
 
     pub fn check_baseline(&self, task_id: &str) -> HarnessResult<()> {
-        let task = self.task(task_id)?;
+        let task = self.migrate_stale_baseline(self.task(task_id)?)?;
         let current = capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths);
         if current.branch != task.baseline.branch || current.head != task.baseline.head {
             return Err(HarnessError::new(
@@ -276,8 +276,25 @@ impl Harness {
         Ok(())
     }
 
+    /// 基线哈希口径升级迁移：旧版本（hash_version < CURRENT_HASH_VERSION）记录的是
+    /// 全量内容哈希，新版本对超大文件改用 size 指纹。口径不一致会让旧任务在文件
+    /// 未变化的情况下也被判为 FILE_CHANGED_EXTERNALLY 而永久锁死，因此在读写校验
+    /// 前透明重算一次基线。
+    fn migrate_stale_baseline(&self, mut task: TaskSession) -> HarnessResult<TaskSession> {
+        if task.baseline.hash_version >= CURRENT_HASH_VERSION {
+            return Ok(task);
+        }
+        let current = capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths);
+        task.baseline = current.clone();
+        task.expected_fingerprint = current.worktree_fingerprint.clone();
+        task.expected_baseline = Some(current);
+        task.updated_at = timestamp();
+        self.store.save_task(&task)?;
+        Ok(task)
+    }
+
     pub fn refresh_expected_state(&self, task_id: &str) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
+        let mut task = self.migrate_stale_baseline(self.task(task_id)?)?;
         let current = capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths);
         task.expected_fingerprint = current.worktree_fingerprint.clone();
         task.expected_baseline = Some(current);
@@ -292,7 +309,7 @@ impl Harness {
         accept_paths: &[String],
         ignore_paths: &[String],
     ) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
+        let mut task = self.migrate_stale_baseline(self.task(task_id)?)?;
         for path in ignore_paths {
             let normalized = normalize_rel_path(path);
             if !normalized.is_empty() && !task.ignored_paths.contains(&normalized) {
@@ -449,7 +466,10 @@ impl Harness {
     }
 
     pub fn project_state(&self, max_files: usize) -> HarnessResult<ProjectState> {
-        let task = self.current_task()?;
+        let task = self
+            .current_task()?
+            .map(|task| self.migrate_stale_baseline(task))
+            .transpose()?;
         let current = task
             .as_ref()
             .map(|task| capture_baseline_with_ignored(&self.workspace_root, &task.ignored_paths))
@@ -546,6 +566,13 @@ impl Harness {
         capture: impl FnOnce() -> ProjectBaseline,
     ) -> HarnessResult<HarnessStatus> {
         let task = self.current_task()?;
+        // 写校验路径（status）先做口径迁移，避免旧任务因哈希口径不一致被误判为
+        // 不可写；status_summary 走 verify_baseline=false，不触发扫描。
+        let task = if verify_baseline {
+            task.map(|task| self.migrate_stale_baseline(task)).transpose()?
+        } else {
+            task
+        };
         // Standalone errors/status need Git metadata, not a snapshot of every
         // file. A home-directory workspace may contain OS-protected media.
         let current = task.as_ref().filter(|_| verify_baseline).map(|task| {
@@ -824,6 +851,7 @@ fn capture_baseline_with_ignored(root: &Path, ignored_paths: &[String]) -> Proje
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     ProjectBaseline {
+        hash_version: CURRENT_HASH_VERSION,
         branch: git_value(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
         head: git_value(root, &["rev-parse", "HEAD"]),
         worktree_fingerprint: fingerprint_entries(&entries),
@@ -1173,5 +1201,34 @@ mod tests {
             .find(|event| event.kind == "known_mutation_accepted")
             .expect("known mutation event");
         assert!(event.affected_files.iter().any(|file| file.path == "lock.txt"));
+    }
+
+    #[test]
+    fn stale_hash_version_is_migrated_instead_of_locking_out() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness root");
+        fs::write(workspace.path().join("a.txt"), "a0\n").expect("a");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("migrate").expect("task");
+
+        // 模拟旧口径基线：hash_version 降级 + 指纹故意错位
+        let mut stale = harness.task(&task.id).expect("load");
+        stale.baseline.hash_version = 1;
+        stale.expected_fingerprint = "stale".into();
+        stale.expected_baseline = None;
+        harness.store.save_task(&stale).expect("save stale");
+
+        // 口径迁移应在校验前透明完成，而不是 FILE_CHANGED_EXTERNALLY 锁死
+        harness
+            .check_baseline(&task.id)
+            .expect("baseline migrates and matches");
+
+        let migrated = harness.task(&task.id).expect("reload");
+        assert_eq!(migrated.baseline.hash_version, CURRENT_HASH_VERSION);
+        assert_ne!(migrated.expected_fingerprint, "stale");
     }
 }
